@@ -4,7 +4,9 @@ import { toolRegistry } from '../tools/registry';
 import { executeTool } from '../tools/executor';
 import { sessionManager } from './session';
 import { agentRegistry } from './registry';
+import { shouldCompact, compactMessages } from '../memory/context';
 import { logger } from '../shared/logger';
+import { memoryManager } from '../memory/store';
 
 interface RuntimeMessage {
   role: 'user' | 'assistant' | 'system' | 'tool';
@@ -31,7 +33,7 @@ export interface SendMessageResult {
 }
 
 export async function sendMessage(input: SendMessageInput): Promise<SendMessageResult> {
-  const agent = agentRegistry.get(input.agentId);
+  const agent = agentRegistry.get(input.agentId) || agentRegistry.getByName(input.agentId);
   if (!agent) throw new Error(`Agent not found: ${input.agentId}`);
 
   agentRegistry.setState(agent.id, 'processing');
@@ -57,9 +59,20 @@ export async function sendMessage(input: SendMessageInput): Promise<SendMessageR
     const allToolResults: ToolResultEntry[] = [];
     let totalUsage: SendMessageResult['usage'];
 
-    // Build context from history
+    // Build context from history + memory
     const history = await sessionManager.getMessages(sessionId, 50);
-    const context: RuntimeMessage[] = history.map((m) => ({
+    let contextMessages = history;
+    if (shouldCompact(history)) {
+      const { messages: compacted, tokensSaved } = compactMessages(history);
+      contextMessages = compacted;
+      logger.info({ sessionId, tokensSaved }, 'Context compacted before inference');
+    }
+    const memoryContext = memoryManager.buildContext(agent.id);
+    const systemPrompt = memoryContext
+      ? `${agent.systemPrompt}\n\n${memoryContext}`
+      : agent.systemPrompt;
+
+    const context: RuntimeMessage[] = contextMessages.map((m) => ({
       role: m.role,
       content: m.content,
       ...(m.role === 'tool' ? { toolCallId: m.toolResults?.[0]?.toolCallId } : {}),
@@ -74,7 +87,7 @@ export async function sendMessage(input: SendMessageInput): Promise<SendMessageR
       const agentTools = toolRegistry.listForAgent(agent.id);
 
       const response = await callLlm({
-        systemPrompt: agent.systemPrompt,
+        systemPrompt,
         messages: context.map((m) => ({
           role: m.role,
           content: m.content,
@@ -207,7 +220,9 @@ export async function* streamMessage(input: SendMessageInput) {
   const agentTools = toolRegistry.listForAgent(agent.id);
 
   const stream = streamLlm({
-    systemPrompt: agent.systemPrompt,
+    systemPrompt: memoryManager.buildContext(agent.id)
+      ? `${agent.systemPrompt}\n\n${memoryManager.buildContext(agent.id)}`
+      : agent.systemPrompt,
     messages: context,
     tools: agentTools,
     modelId: agent.model,

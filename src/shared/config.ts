@@ -30,12 +30,28 @@ const schedulerSchema = z.object({
 
 const bridgeSchema = z.object({
   enabled: z.boolean().default(false),
-  peers: z.array(z.record(z.unknown())).default([]),
+  secret: z.string().default('anorion-bridge-dev'),
+  port: z.number().default(4260),
+  peers: z.array(z.object({
+    url: z.string(),
+    secret: z.string().optional(),
+  })).default([]),
 });
 
 const memorySchema = z.object({
   provider: z.enum(['file', 'sqlite']).default('file'),
   directory: z.string().default('./data/memory'),
+});
+
+const telegramChannelSchema = z.object({
+  enabled: z.boolean().default(false),
+  botToken: z.string().default(''),
+  allowedUsers: z.array(z.string()).default([]),
+  defaultAgent: z.string().default('example'),
+});
+
+const channelsSchema = z.object({
+  telegram: telegramChannelSchema.default({}),
 });
 
 const configSchema = z.object({
@@ -44,6 +60,7 @@ const configSchema = z.object({
   scheduler: schedulerSchema.default({}),
   bridge: bridgeSchema.default({}),
   memory: memorySchema.default({}),
+  channels: channelsSchema.default({}),
 });
 
 export type AnorionConfig = z.infer<typeof configSchema>;

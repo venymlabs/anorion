@@ -5,9 +5,61 @@ import { eq, desc } from 'drizzle-orm';
 import { nanoid } from 'nanoid';
 import { logger } from '../shared/logger';
 
+const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000; // 30 min
+const DEFAULT_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
 class SessionManager {
   private sessions = new Map<string, Session>();
   private db: Db | null = null;
+  private idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS;
+  private ttlMs = DEFAULT_TTL_MS;
+  private idleCheckInterval: ReturnType<typeof setInterval> | null = null;
+
+  setIdleTimeout(ms: number): void {
+    this.idleTimeoutMs = ms;
+  }
+
+  setTtl(ms: number): void {
+    this.ttlMs = ms;
+  }
+
+  startIdleChecker(): void {
+    if (this.idleCheckInterval) return;
+    this.idleCheckInterval = setInterval(() => {
+      this.checkIdleSessions();
+    }, 60_000); // check every minute
+  }
+
+  stopIdleChecker(): void {
+    if (this.idleCheckInterval) {
+      clearInterval(this.idleCheckInterval);
+      this.idleCheckInterval = null;
+    }
+  }
+
+  private checkIdleSessions(): void {
+    const now = Date.now();
+    for (const [id, session] of this.sessions) {
+      if (session.status !== 'active' && session.status !== 'idle') continue;
+
+      const lastActive = new Date(session.lastActive).getTime();
+      const age = new Date(session.createdAt).getTime();
+
+      // Check TTL
+      if (now - age > this.ttlMs) {
+        logger.info({ sessionId: id, age: now - age }, 'Session TTL expired, destroying');
+        this.destroy(id);
+        continue;
+      }
+
+      // Check idle
+      if (session.status === 'active' && now - lastActive > this.idleTimeoutMs) {
+        session.status = 'idle';
+        session.updatedAt = new Date().toISOString();
+        logger.info({ sessionId: id, idleFor: now - lastActive }, 'Session marked idle');
+      }
+    }
+  }
 
   setDb(db: Db): void {
     this.db = db;
@@ -85,6 +137,10 @@ class SessionManager {
       session.tokensUsed += (msg.tokensIn || 0) + (msg.tokensOut || 0);
       session.lastActive = new Date().toISOString();
       session.updatedAt = new Date().toISOString();
+      // Wake idle session
+      if (session.status === 'idle') {
+        session.status = 'active';
+      }
     }
 
     if (this.db) {

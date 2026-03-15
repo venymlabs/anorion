@@ -17,6 +17,7 @@
     "better-sqlite3": "^12.8.0",
     "drizzle-kit": "^0.31.9",
     "drizzle-orm": "^0.45.1",
+    "grammy": "^1.41.1",
     "hono": "^4.12.8",
     "nanoid": "^5.1.6",
     "node-cron": "^4.2.1",

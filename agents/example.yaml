@@ -1,5 +1,5 @@
 name: example
-model: openai/gpt-4o
+model: zai/glm-5
 systemPrompt: "You are a helpful assistant. You have access to tools."
 tools:
   - echo

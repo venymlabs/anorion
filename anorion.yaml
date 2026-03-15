@@ -9,16 +9,25 @@ gateway:
 
 agents:
   dir: ./agents
-  defaultModel: openai/gpt-4o
+  defaultModel: zai/glm-5
   defaultTimeoutMs: 120000
   maxSubagents: 5
   idleTimeoutMs: 1800000
+
+channels:
+  telegram:
+    enabled: false
+    botToken: ${TELEGRAM_BOT_TOKEN:-}
+    allowedUsers: []
+    defaultAgent: example
 
 scheduler:
   enabled: false
 
 bridge:
   enabled: false
+  secret: ${BRIDGE_SECRET:-anorion-bridge-dev}
+  port: 4260
   peers: []
 
 memory:

@@ -1,8 +1,14 @@
 import { generateText, streamText, type CoreMessage, type Tool as AiTool } from 'ai';
-import { openai } from '@ai-sdk/openai';
+import { createOpenAI } from '@ai-sdk/openai';
 import { anthropic } from '@ai-sdk/anthropic';
 import { logger } from '../shared/logger';
 import type { ToolDefinition } from '../shared/types';
+
+// zai is our primary provider (OpenAI-compatible)
+const zai = createOpenAI({
+  baseURL: process.env.ZAI_BASE_URL || 'https://api.z.ai/api/paas/v4',
+  apiKey: process.env.ZAI_API_KEY,
+});
 
 function getModel(modelId: string) {
   const [provider, ...rest] = modelId.split('/');
@@ -10,13 +16,13 @@ function getModel(modelId: string) {
 
   switch (provider) {
     case 'openai':
-      return openai(modelName);
+      return createOpenAI({ apiKey: process.env.OPENAI_API_KEY })(modelName);
     case 'anthropic':
     case 'claude':
       return anthropic(modelName);
+    case 'zai':
     default:
-      // Default to openai-compatible
-      return openai(modelName);
+      return zai(modelName);
   }
 }
 
