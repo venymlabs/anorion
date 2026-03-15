@@ -103,7 +103,9 @@ async function main() {
   // Setup WebSocket
   setupWebSocket(server);
 
-  // Bridge (opt-in)
+  // Bridge routes (always available; return disabled if bridge not configured)
+  registerBridgeRoutes(app);
+
   if (config.bridge.enabled) {
     const { BridgeServer } = await import('./bridge/server');
     const { Federator } = await import('./bridge/federator');
@@ -112,9 +114,7 @@ async function main() {
     bridgeServer.attach(server);
     const federator = new Federator(gatewayId, config.bridge.secret, bridgeServer);
     setBridge(federator);
-    registerBridgeRoutes(app);
 
-    // Connect to configured peers
     for (const peer of config.bridge.peers) {
       await federator.connectPeer(peer.url, peer.secret || config.bridge.secret);
     }
