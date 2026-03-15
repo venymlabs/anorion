@@ -1,23 +1,23 @@
-import Database from 'better-sqlite3';
-import { drizzle, type BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
+import { Database } from 'bun:sqlite';
+import { drizzle } from 'drizzle-orm/bun-sqlite';
 import { resolve } from 'path';
 import { mkdirSync } from 'fs';
 import * as schema from './schema';
 import { logger } from '../logger';
 
-export type Db = BetterSQLite3Database<typeof schema>;
+export type Db = ReturnType<typeof drizzle<typeof schema>>;
 
 export function initDatabase(dbPath: string): Db {
   const fullPath = resolve(process.cwd(), dbPath);
-  mkdirSync(fullPath.slice(0, fullPath.lastIndexOf('/')), { recursive: true });
+  const dir = fullPath.slice(0, fullPath.lastIndexOf('/'));
+  mkdirSync(dir, { recursive: true });
 
   const sqlite = new Database(fullPath);
-  sqlite.pragma('journal_mode = WAL');
-  sqlite.pragma('foreign_keys = ON');
+  sqlite.exec('PRAGMA journal_mode = WAL');
+  sqlite.exec('PRAGMA foreign_keys = ON');
 
   const db = drizzle(sqlite, { schema });
 
-  // Create tables directly (we'll add drizzle-kit migrations later)
   sqlite.exec(`
     CREATE TABLE IF NOT EXISTS agents (
       id TEXT PRIMARY KEY,

@@ -24,8 +24,9 @@ const noAuthPaths = ['/health'];
 app.use('*', async (c, next) => {
   if (noAuthPaths.includes(c.req.path)) return next();
 
-  // Allow if no keys configured
-  if (validKeys.size === 0) return next();
+  // Allow if no keys configured or only default dev keys
+  const hasRealKeys = [...validKeys.keys()].some((k) => k !== 'anorion-dev-key');
+  if (!hasRealKeys) return next();
 
   const apiKey = c.req.header('X-API-Key');
   if (!apiKey || !validKeys.has(apiKey)) {

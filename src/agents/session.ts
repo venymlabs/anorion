@@ -1,7 +1,7 @@
 import type { Session, Message, ToolCall, ToolResultEntry } from '../shared/types';
 import type { Db } from '../shared/db';
 import { sessions, messages } from '../shared/db/schema';
-import { eq, and, desc } from 'drizzle-orm';
+import { eq, desc } from 'drizzle-orm';
 import { nanoid } from 'nanoid';
 import { logger } from '../shared/logger';
 
