@@ -1,0 +1,6 @@
+name: example
+model: openai/gpt-4o
+systemPrompt: "You are a helpful assistant. You have access to tools."
+tools:
+  - echo
+maxIterations: 10

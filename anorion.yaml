@@ -1,0 +1,26 @@
+gateway:
+  host: 0.0.0.0
+  port: 4250
+  apiKeys:
+    - name: admin
+      key: ${ANORION_ADMIN_KEY:-anorion-dev-key}
+      scopes: ["*"]
+  database: ./data/anorion.db
+
+agents:
+  dir: ./agents
+  defaultModel: openai/gpt-4o
+  defaultTimeoutMs: 120000
+  maxSubagents: 5
+  idleTimeoutMs: 1800000
+
+scheduler:
+  enabled: false
+
+bridge:
+  enabled: false
+  peers: []
+
+memory:
+  provider: file
+  directory: ./data/memory
