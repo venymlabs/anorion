@@ -9,6 +9,7 @@ import { logger } from '../shared/logger';
 const MAX_DEPTH = 2;
 const MAX_CONCURRENT = 5;
 const DEFAULT_TTL = 5 * 60 * 1000;
+const MAX_TOTAL_CHILDREN = 200;
 
 interface ChildAgent {
   id: string;
@@ -23,6 +24,12 @@ interface ChildAgent {
 }
 
 const children = new Map<string, Map<string, ChildAgent>>(); // parentId -> childId -> child
+
+function totalChildren(): number {
+  let count = 0;
+  for (const map of children.values()) count += map.size;
+  return count;
+}
 
 function getChildren(parentId: string): Map<string, ChildAgent> {
   if (!children.has(parentId)) children.set(parentId, new Map());
@@ -45,6 +52,7 @@ export function spawnSubAgent(params: {
 
   const siblings = getChildren(params.parentId);
   if (siblings.size >= MAX_CONCURRENT) throw new Error(`Max concurrent children (${MAX_CONCURRENT}) reached`);
+  if (totalChildren() >= MAX_TOTAL_CHILDREN) throw new Error(`Global children limit (${MAX_TOTAL_CHILDREN}) reached`);
 
   const childId = nanoid(10);
   const ttl = params.ttl || DEFAULT_TTL;
@@ -109,11 +117,16 @@ export function spawnSubAgent(params: {
 }
 
 function cleanup(parentId: string, childId: string): void {
-  const siblings = getChildren(parentId);
+  const siblings = children.get(parentId);
+  if (!siblings) return;
   const child = siblings.get(childId);
   if (child) {
     clearTimeout(child.timer);
     siblings.delete(childId);
+  }
+  // Remove empty parent entry to avoid leaking the outer Map
+  if (siblings.size === 0) {
+    children.delete(parentId);
   }
   // Cleanup ephemeral agent
   agentRegistry.delete(childId).catch(() => {});

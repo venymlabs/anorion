@@ -1,20 +1,21 @@
 // Bridge Server — inbound WebSocket acceptor on /bridge path
 
-import type { Server } from 'node:http';
-import {
+import type {
   BridgeMessage,
+  HelloPayload,
+  MessageForwardPayload,
+  MessageResponsePayload,
+} from './protocol';
+import {
   createBridgeMessage,
   parseBridgeMessage,
-  type HelloPayload,
-  type MessageForwardPayload,
-  type MessageResponsePayload,
 } from './protocol';
 import { logger } from '../shared/logger';
 import { agentRegistry } from '../agents/registry';
 
 interface BridgeConnection {
   gatewayId: string;
-  ws: WebSocket;
+  ws: { send: (data: string) => void; addEventListener: (type: string, fn: (ev: any) => void) => void; close: (code?: number, reason?: string) => void; readyState?: number };
   connectedAt: number;
   lastPong: number;
   agents: { id: string; name: string; status: string }[];
@@ -30,52 +31,6 @@ export class BridgeServer {
   constructor(ownGatewayId: string, secret: string) {
     this.ownGatewayId = ownGatewayId;
     this.secret = secret;
-  }
-
-  attach(server: Server): void {
-    server.on('upgrade', (req, socket, head) => {
-      const url = new URL(req.url || '', 'http://localhost');
-      if (url.pathname !== '/bridge') return; // not ours
-
-      // Auth via query param
-      const secret = url.searchParams.get('secret');
-      if (secret !== this.secret) {
-        logger.warn('Bridge connection rejected: invalid secret');
-        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-        socket.destroy();
-        return;
-      }
-
-      const ws = new WebSocket(req);
-      ws.accept();
-
-      const conn: BridgeConnection = {
-        gatewayId: '',
-        ws,
-        connectedAt: Date.now(),
-        lastPong: Date.now(),
-        agents: [],
-      };
-
-      ws.onmessage = (event) => {
-        const msg = parseBridgeMessage(event.data as string);
-        if (!msg) {
-          ws.send(JSON.stringify({ error: 'Invalid message' }));
-          return;
-        }
-
-        void this.handleMessage(conn, msg);
-      };
-
-      ws.onclose = () => {
-        if (conn.gatewayId) {
-          this.connections.delete(conn.gatewayId);
-          logger.info({ peerId: conn.gatewayId }, 'Bridge peer disconnected');
-        }
-      };
-
-      ws.onerror = () => {};
-    });
 
     // Health check: disconnect stale peers
     setInterval(() => {
@@ -88,8 +43,46 @@ export class BridgeServer {
         }
       }
     }, 30_000);
+  }
 
-    logger.info('Bridge server attached on /bridge');
+  /** Handle an upgraded WebSocket connection for /bridge (called from Bun.serve websocket handlers) */
+  handleConnection(ws: { send: (data: string) => void; addEventListener: (type: string, fn: (ev: any) => void) => void; close: (code?: number, reason?: string) => void }, secret?: string): boolean {
+    if (secret !== this.secret) {
+      logger.warn('Bridge connection rejected: invalid secret');
+      ws.close(4001, 'Unauthorized');
+      return false;
+    }
+
+    const conn: BridgeConnection = {
+      gatewayId: '',
+      ws,
+      connectedAt: Date.now(),
+      lastPong: Date.now(),
+      agents: [],
+    };
+
+    ws.addEventListener('message', (event) => {
+      const msg = parseBridgeMessage(event.data as string);
+      if (!msg) {
+        ws.send(JSON.stringify({ error: 'Invalid message' }));
+        return;
+      }
+      void this.handleMessage(conn, msg);
+    });
+
+    ws.addEventListener('close', () => {
+      if (conn.gatewayId) {
+        this.connections.delete(conn.gatewayId);
+        logger.info({ peerId: conn.gatewayId }, 'Bridge peer disconnected');
+      }
+    });
+
+    return true;
+  }
+
+  /** Legacy attach — no-op for Bun.serve(), use handleConnection instead */
+  attach(_server: unknown): void {
+    logger.info('Bridge server ready on /bridge (via Bun.serve)');
   }
 
   private async handleMessage(conn: BridgeConnection, msg: BridgeMessage): Promise<void> {
@@ -191,7 +184,7 @@ export class BridgeServer {
     timeoutMs = 30_000,
   ): Promise<BridgeMessage> {
     const conn = this.connections.get(gatewayId);
-    if (!conn || conn.ws.readyState !== WebSocket.OPEN) {
+    if (!conn || (conn.ws as any).readyState !== 1) {
       throw new Error(`Peer not connected: ${gatewayId}`);
     }
 
@@ -212,7 +205,7 @@ export class BridgeServer {
   broadcastAgentUpdate(agentId: string, status: string): void {
     const msg = createBridgeMessage('agent-update', this.ownGatewayId, { agentId, status });
     for (const [, conn] of this.connections) {
-      if (conn.ws.readyState === WebSocket.OPEN) {
+      if ((conn.ws as any).readyState === 1) {
         conn.ws.send(JSON.stringify(msg));
       }
     }

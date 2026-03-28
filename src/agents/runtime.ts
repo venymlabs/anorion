@@ -7,6 +7,7 @@ import { agentRegistry } from './registry';
 import { shouldCompact, compactMessages } from '../memory/context';
 import { logger } from '../shared/logger';
 import { memoryManager } from '../memory/store';
+import { eventBus } from '../shared/events';
 
 interface RuntimeMessage {
   role: 'user' | 'assistant' | 'system' | 'tool';
@@ -45,6 +46,8 @@ export async function sendMessage(input: SendMessageInput): Promise<SendMessageR
       const session = await sessionManager.create(agent.id, input.channelId);
       sessionId = session.id;
     }
+
+    eventBus.emit('agent:processing', { agentId: agent.id, sessionId, timestamp: Date.now() });
 
     // Store user message
     await sessionManager.addMessage({
@@ -115,13 +118,16 @@ export async function sendMessage(input: SendMessageInput): Promise<SendMessageR
           durationMs: Date.now() - startTime,
         });
 
+        const durationMs = Date.now() - startTime;
+        eventBus.emit('agent:response', { agentId: agent.id, sessionId, content: response.content, durationMs, tokensUsed: totalUsage?.totalTokens, timestamp: Date.now() });
+
         return {
           sessionId,
           content: response.content,
           toolCalls: allToolCalls,
           toolResults: allToolResults,
           usage: totalUsage,
-          durationMs: Date.now() - startTime,
+          durationMs,
         };
       }
 
@@ -152,6 +158,8 @@ export async function sendMessage(input: SendMessageInput): Promise<SendMessageR
           agentId: agent.id,
           sessionId,
         });
+
+        eventBus.emit('agent:tool-call', { agentId: agent.id, sessionId, toolName: tc.name, toolCallId: tc.id, timestamp: Date.now() });
 
         const toolResult: ToolResultEntry = {
           toolCallId: tc.id,
@@ -188,9 +196,11 @@ export async function sendMessage(input: SendMessageInput): Promise<SendMessageR
   } catch (err) {
     logger.error({ agentId: agent.id, error: (err as Error).message }, 'Agent runtime error');
     agentRegistry.setState(agent.id, 'error');
+    eventBus.emit('agent:error', { agentId: agent.id, sessionId: input.sessionId || '', error: (err as Error).message, timestamp: Date.now() });
     throw err;
   } finally {
     agentRegistry.setState(agent.id, 'idle');
+    eventBus.emit('agent:idle', { agentId: agent.id, timestamp: Date.now() });
   }
 }
 

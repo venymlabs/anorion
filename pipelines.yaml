@@ -1,0 +1,48 @@
+# Example Pipeline Definitions
+# Place in /home/d/anorion/pipelines.yaml
+
+pipelines:
+  - name: research-summarize
+    description: "Research a topic then summarize the findings"
+    chainMode: last-output
+    onFailure: stop
+    maxRetries: 1
+    steps:
+      - agent: researcher
+        systemPrompt: "You are a thorough researcher. Find all relevant information on the given topic."
+        maxIterations: 5
+        transform: raw
+      - agent: writer
+        systemPrompt: "You are a concise writer. Take the research and create a clear, well-structured summary."
+        prefix: "Based on the following research, write a concise summary:\n\n"
+        maxIterations: 3
+        transform: raw
+
+  - name: code-review
+    description: "Generate code then review it for issues"
+    chainMode: last-output
+    onFailure: stop
+    maxRetries: 0
+    steps:
+      - agent: coder
+        systemPrompt: "You are an expert programmer. Write clean, efficient code."
+        maxIterations: 5
+      - agent: reviewer
+        systemPrompt: "You are a senior code reviewer. Check for bugs, security issues, and style problems."
+        prefix: "Review the following code for issues:\n\n"
+        transform: raw
+
+  - name: analyze-trade
+    description: "Research → analyze → decide pipeline for trading signals"
+    chainMode: all-outputs
+    onFailure: stop
+    maxRetries: 1
+    steps:
+      - agent: news-analyst
+        systemPrompt: "Analyze the news for market-moving implications."
+        maxIterations: 3
+      - agent: quant
+        systemPrompt: "You are a quantitative analyst. Assess the trading opportunity."
+        prefix: "Based on this analysis, provide a trading signal with confidence score:\n\n"
+        maxIterations: 3
+        transform: json-extract

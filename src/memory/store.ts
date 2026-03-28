@@ -1,10 +1,9 @@
-import { mkdirSync, existsSync, readFileSync, writeFileSync, readdirSync, rmSync, statSync } from 'fs';
-import { resolve, join } from 'path';
+import { type Database } from 'bun:sqlite';
 import { logger } from '../shared/logger';
 
 export type MemoryCategory = 'identity' | 'preference' | 'fact' | 'lesson' | 'context';
 
-interface MemoryFileEntry {
+export interface MemoryFileEntry {
   key: string;
   value: unknown;
   category: MemoryCategory;
@@ -12,110 +11,173 @@ interface MemoryFileEntry {
   updatedAt: string;
 }
 
+class LRUCache<T> {
+  private cache = new Map<string, T>();
+
+  constructor(private maxSize: number) {}
+
+  get(key: string): T | undefined {
+    const val = this.cache.get(key);
+    if (val !== undefined) {
+      this.cache.delete(key);
+      this.cache.set(key, val);
+    }
+    return val;
+  }
+
+  set(key: string, value: T): void {
+    if (this.cache.has(key)) {
+      this.cache.delete(key);
+    } else if (this.cache.size >= this.maxSize) {
+      const first = this.cache.keys().next().value!;
+      this.cache.delete(first);
+    }
+    this.cache.set(key, value);
+  }
+
+  deleteByPrefix(prefix: string): void {
+    for (const key of [...this.cache.keys()]) {
+      if (key.startsWith(prefix)) this.cache.delete(key);
+    }
+  }
+
+  clear(): void {
+    this.cache.clear();
+  }
+}
+
 class MemoryManager {
-  private basePath: string;
+  private db: Database | null = null;
+  private stmtCache = new Map<string, ReturnType<Database['prepare']>>();
+  private cache = new LRUCache<MemoryFileEntry[]>(500);
 
-  constructor(basePath?: string) {
-    this.basePath = basePath || resolve(process.cwd(), 'data', 'memory');
-    mkdirSync(this.basePath, { recursive: true });
+  setDb(db: Database): void {
+    this.db = db;
   }
 
-  private agentDir(agentId: string): string {
-    return join(this.basePath, agentId);
+  private getDb(): Database {
+    if (!this.db) throw new Error('MemoryManager: DB not set — call setDb() first');
+    return this.db;
   }
 
-  private ensureAgentDir(agentId: string): void {
-    mkdirSync(this.agentDir(agentId), { recursive: true });
+  private stmt(sql: string) {
+    let s = this.stmtCache.get(sql);
+    if (!s) {
+      s = this.getDb().prepare(sql);
+      this.stmtCache.set(sql, s);
+    }
+    return s;
+  }
+
+  private invalidateAgent(agentId: string): void {
+    this.cache.deleteByPrefix(`list:${agentId}:`);
   }
 
   save(agentId: string, category: MemoryCategory, key: string, value: unknown): MemoryFileEntry {
-    this.ensureAgentDir(agentId);
     const now = new Date().toISOString();
-    const entry: MemoryFileEntry = {
-      key,
-      value,
-      category,
-      createdAt: now,
-      updatedAt: now,
-    };
+    const valueStr = typeof value === 'string' ? value : JSON.stringify(value);
 
-    // Check if existing
-    const existing = this.getByKey(agentId, key);
-    if (existing) {
-      entry.createdAt = existing.createdAt;
-    }
+    // Preserve createdAt on update
+    const existing = this.stmt(
+      'SELECT created_at FROM memory_entries WHERE agent_id = ? AND key = ?',
+    ).get(agentId, key) as { created_at: string } | null;
 
-    const filePath = join(this.agentDir(agentId), `${this.sanitizeKey(key)}.json`);
-    writeFileSync(filePath, JSON.stringify(entry, null, 2), 'utf-8');
+    const createdAt = existing?.created_at ?? now;
 
+    this.stmt(`
+      INSERT INTO memory_entries (id, agent_id, key, value, category, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(agent_id, key) DO UPDATE SET
+        value = excluded.value,
+        category = excluded.category,
+        updated_at = excluded.updated_at
+    `).run(crypto.randomUUID(), agentId, key, valueStr, category, createdAt, now);
+
+    this.invalidateAgent(agentId);
     logger.debug({ agentId, category, key }, 'Memory saved');
-    return entry;
+
+    return { key, value, category, createdAt, updatedAt: now };
   }
 
   load(agentId: string): MemoryFileEntry[] {
-    const dir = this.agentDir(agentId);
-    if (!existsSync(dir)) return [];
+    const cacheKey = `list:${agentId}:all`;
+    const cached = this.cache.get(cacheKey);
+    if (cached) return cached;
 
-    const entries: MemoryFileEntry[] = [];
-    const files = readdirSync(dir).filter((f) => f.endsWith('.json'));
+    const rows = this.stmt(
+      'SELECT key, value, category, created_at, updated_at FROM memory_entries WHERE agent_id = ? ORDER BY updated_at DESC',
+    ).all(agentId) as Record<string, string>[];
 
-    for (const file of files) {
-      try {
-        const raw = readFileSync(join(dir, file), 'utf-8');
-        const entry = JSON.parse(raw) as MemoryFileEntry;
-        entries.push(entry);
-      } catch {
-        // skip corrupt files
-      }
-    }
-
+    const entries = rows.map((r) => this.rowToEntry(r));
+    this.cache.set(cacheKey, entries);
     return entries;
   }
 
   loadByCategory(agentId: string, category: MemoryCategory): MemoryFileEntry[] {
-    return this.load(agentId).filter((e) => e.category === category);
+    const rows = this.stmt(
+      'SELECT key, value, category, created_at, updated_at FROM memory_entries WHERE agent_id = ? AND category = ? ORDER BY updated_at DESC',
+    ).all(agentId, category) as Record<string, string>[];
+
+    return rows.map((r) => this.rowToEntry(r));
   }
 
   search(agentId: string, query: string): MemoryFileEntry[] {
-    const entries = this.load(agentId);
-    const terms = query.toLowerCase().split(/\s+/);
+    if (!query.trim()) return this.load(agentId);
 
-    return entries.filter((entry) => {
-      const haystack = [
-        entry.key,
-        typeof entry.value === 'string' ? entry.value : JSON.stringify(entry.value),
-        entry.category,
-      ].join(' ').toLowerCase();
+    const db = this.getDb();
+    // Prefix-match tokens for FTS5
+    const ftsQuery = query
+      .trim()
+      .split(/\s+/)
+      .map((t) => `${t}*`)
+      .join(' ');
 
-      return terms.every((term) => haystack.includes(term));
-    });
+    const rows = db
+      .prepare(
+        `SELECT me.key, me.value, me.category, me.created_at, me.updated_at
+         FROM memory_entries me
+         JOIN memory_fts fts ON me.rowid = fts.rowid
+         WHERE me.agent_id = ? AND memory_fts MATCH ?
+         ORDER BY rank`,
+      )
+      .all(agentId, ftsQuery) as Record<string, string>[];
+
+    return rows.map((r) => this.rowToEntry(r));
   }
 
   forget(agentId: string, key: string): boolean {
-    const filePath = join(this.agentDir(agentId), `${this.sanitizeKey(key)}.json`);
-    if (!existsSync(filePath)) return false;
-    rmSync(filePath);
-    logger.debug({ agentId, key }, 'Memory forgotten');
-    return true;
+    const result = this.stmt(
+      'DELETE FROM memory_entries WHERE agent_id = ? AND key = ?',
+    ).run(agentId, key);
+
+    if (result.changes > 0) {
+      this.invalidateAgent(agentId);
+      logger.debug({ agentId, key }, 'Memory forgotten');
+      return true;
+    }
+    return false;
   }
 
   getByKey(agentId: string, key: string): MemoryFileEntry | null {
-    const filePath = join(this.agentDir(agentId), `${this.sanitizeKey(key)}.json`);
-    if (!existsSync(filePath)) return null;
-    try {
-      const raw = readFileSync(filePath, 'utf-8');
-      return JSON.parse(raw) as MemoryFileEntry;
-    } catch {
-      return null;
-    }
+    const row = this.stmt(
+      'SELECT key, value, category, created_at, updated_at FROM memory_entries WHERE agent_id = ? AND key = ?',
+    ).get(agentId, key) as Record<string, string> | null;
+
+    return row ? this.rowToEntry(row) : null;
   }
 
   clear(agentId: string): boolean {
-    const dir = this.agentDir(agentId);
-    if (!existsSync(dir)) return false;
-    rmSync(dir, { recursive: true });
-    logger.info({ agentId }, 'All memory cleared');
-    return true;
+    const result = this.stmt(
+      'DELETE FROM memory_entries WHERE agent_id = ?',
+    ).run(agentId);
+
+    this.invalidateAgent(agentId);
+
+    if (result.changes > 0) {
+      logger.info({ agentId }, 'All memory cleared');
+      return true;
+    }
+    return false;
   }
 
   /** Build a memory context string for injection into system prompts */
@@ -131,8 +193,21 @@ class MemoryManager {
     return lines.join('\n');
   }
 
-  private sanitizeKey(key: string): string {
-    return key.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 200);
+  private rowToEntry(row: Record<string, string | undefined>): MemoryFileEntry {
+    const raw = row.value ?? '';
+    let value: unknown = raw;
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      // value is a plain string
+    }
+    return {
+      key: row.key ?? '',
+      value,
+      category: (row.category ?? 'fact') as MemoryCategory,
+      createdAt: row.created_at ?? '',
+      updatedAt: row.updated_at ?? '',
+    };
   }
 }
 

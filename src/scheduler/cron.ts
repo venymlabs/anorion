@@ -1,7 +1,5 @@
 import type { Db } from '../shared/db';
-import { schedules } from '../shared/db/schema';
-import { eq } from 'drizzle-orm';
-import { nanoid } from 'nanoid';
+import type { PreparedStatements } from '../shared/db/prepared';
 import { sendMessage } from '../agents/runtime';
 import { agentRegistry } from '../agents/registry';
 import { logger } from '../shared/logger';
@@ -24,27 +22,29 @@ type CronTask = { stop: () => void; task: cron.ScheduledTask };
 
 class ScheduleManager {
   private db: Db | null = null;
+  private prepared: PreparedStatements | null = null;
   private jobs = new Map<string, ScheduleJob>();
   private tasks = new Map<string, CronTask>();
 
-  setDb(db: Db): void {
+  setDb(db: Db, prepared: PreparedStatements): void {
     this.db = db;
+    this.prepared = prepared;
   }
 
   async loadAll(): Promise<void> {
-    if (!this.db) return;
-    const rows = await this.db.select().from(schedules);
+    if (!this.prepared) return;
+    const rows = this.prepared.scheduleGetAll.all() as any[];
     for (const row of rows) {
       const job: ScheduleJob = {
         id: row.id,
         name: row.name,
-        agentId: row.agentId,
-        cronExpr: row.cronExpr,
+        agentId: row.agent_id,
+        cronExpr: row.cron_expr,
         payload: row.task,
-        enabled: row.enabled,
-        lastRunAt: row.lastRun ?? undefined,
-        nextRunAt: row.nextRun ?? undefined,
-        createdAt: row.createdAt,
+        enabled: !!row.enabled,
+        lastRunAt: row.last_run ?? undefined,
+        nextRunAt: row.next_run ?? undefined,
+        createdAt: row.created_at,
       };
       this.jobs.set(job.id, job);
       if (job.enabled) {
@@ -55,7 +55,7 @@ class ScheduleManager {
   }
 
   async create(input: { name: string; agentId: string; schedule: string; payload: string; mode?: 'systemEvent' | 'agentTurn' }): Promise<ScheduleJob> {
-    const id = nanoid(10);
+    const id = crypto.randomUUID().slice(0, 10);
     const now = new Date().toISOString();
 
     // Validate cron expression
@@ -79,15 +79,15 @@ class ScheduleManager {
 
     this.jobs.set(id, job);
 
-    if (this.db) {
-      await this.db.insert(schedules).values({
-        id: job.id,
-        agentId: job.agentId,
-        name: job.name,
-        cronExpr: job.cronExpr,
-        task: job.payload,
-        enabled: true,
-        createdAt: now,
+    if (this.prepared) {
+      this.prepared.scheduleInsert.run({
+        $id: job.id,
+        $agentId: job.agentId,
+        $name: job.name,
+        $cronExpr: job.cronExpr,
+        $task: job.payload,
+        $enabled: 1,
+        $createdAt: now,
       });
     }
 
@@ -128,13 +128,14 @@ class ScheduleManager {
 
     this.jobs.set(id, updated);
 
-    if (this.db) {
-      await this.db.update(schedules).set({
-        name: updated.name,
-        cronExpr: updated.cronExpr,
-        task: updated.payload,
-        enabled: updated.enabled,
-      }).where(eq(schedules.id, id));
+    if (this.prepared) {
+      this.prepared.scheduleUpdate.run({
+        $id: id,
+        $name: updated.name,
+        $cronExpr: updated.cronExpr,
+        $task: updated.payload,
+        $enabled: updated.enabled ? 1 : 0,
+      });
     }
 
     if (updated.enabled) {
@@ -152,8 +153,8 @@ class ScheduleManager {
     this.stopCron(id);
     this.jobs.delete(id);
 
-    if (this.db) {
-      await this.db.delete(schedules).where(eq(schedules.id, id));
+    if (this.prepared) {
+      this.prepared.scheduleDelete.run({ $id: id });
     }
 
     logger.info({ id }, 'Schedule removed');
@@ -221,10 +222,8 @@ class ScheduleManager {
       });
     }
 
-    if (this.db) {
-      await this.db.update(schedules).set({
-        lastRun: now,
-      }).where(eq(schedules.id, job.id));
+    if (this.prepared) {
+      this.prepared.scheduleSetLastRun.run({ $id: job.id, $lastRun: now });
     }
   }
 

@@ -1,0 +1,66 @@
+# Anorion Configuration — Full Schema
+# Copy and modify as needed
+
+gateway:
+  host: 0.0.0.0
+  port: 4250
+  apiKeys:
+    - name: admin
+      key: ${ANORION_ADMIN_KEY:-anorion-dev-key}
+      scopes: ["*"]
+  database: ./data/anorion.db
+
+agents:
+  dir: ./agents
+  defaultModel: zai/glm-5.1
+  defaultTimeoutMs: 120000
+  maxSubagents: 5
+  idleTimeoutMs: 1800000
+
+channels:
+  telegram:
+    enabled: false
+    botToken: ${TELEGRAM_BOT_TOKEN:-}
+    allowedUsers: []
+    defaultAgent: example
+  webhook:
+    enabled: false
+    inboundSecret: ${WEBHOOK_SECRET:-anorion-webhook-dev}
+    outboundUrls: []
+    allowedIps: []
+
+scheduler:
+  enabled: true
+
+bridge:
+  enabled: false
+  secret: ${BRIDGE_SECRET:-anorion-bridge-dev}
+  port: 4260
+  peers: []
+
+memory:
+  provider: sqlite
+  directory: ./data/memory
+
+# ── Wave 2 Features ──
+
+tokenBudget:
+  sessionLimit: 500000
+  dailyLimit: 2000000
+  globalDailyLimit: 10000000
+  mode: enforce  # 'enforce' or 'track'
+
+audit:
+  enabled: true
+  database: ./data/audit.db
+  retentionDays: 90
+
+skills:
+  dir: ./skills
+  watch: true  # auto-reload on file changes
+
+pipelines:
+  dir: ./pipelines.yaml
+
+metrics:
+  enabled: true

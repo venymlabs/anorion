@@ -1,30 +1,11 @@
+// LLM Provider — unified interface using multi-provider registry
+
 import { generateText, streamText, type CoreMessage, type Tool as AiTool } from 'ai';
-import { createOpenAI } from '@ai-sdk/openai';
-import { anthropic } from '@ai-sdk/anthropic';
+import { resolveModel, type ResolvedModel } from './providers';
 import { logger } from '../shared/logger';
+import { eventBus } from '../shared/events';
 import type { ToolDefinition } from '../shared/types';
-
-// zai is our primary provider (OpenAI-compatible)
-const zai = createOpenAI({
-  baseURL: process.env.ZAI_BASE_URL || 'https://api.z.ai/api/paas/v4',
-  apiKey: process.env.ZAI_API_KEY,
-});
-
-function getModel(modelId: string) {
-  const [provider, ...rest] = modelId.split('/');
-  const modelName = rest.join('/') || modelId;
-
-  switch (provider) {
-    case 'openai':
-      return createOpenAI({ apiKey: process.env.OPENAI_API_KEY })(modelName);
-    case 'anthropic':
-    case 'claude':
-      return anthropic(modelName);
-    case 'zai':
-    default:
-      return zai(modelName);
-  }
-}
+import { tokenBudget } from '../shared/token-budget';
 
 export interface LlmOptions {
   systemPrompt: string;
@@ -36,38 +17,139 @@ export interface LlmOptions {
   temperature?: number;
 }
 
+// ── Retry with exponential backoff + jitter ──
+
+interface RetryConfig {
+  maxRetries: number;
+  baseDelayMs: number;
+  maxDelayMs: number;
+}
+
+const DEFAULT_RETRY: RetryConfig = {
+  maxRetries: 3,
+  baseDelayMs: 1000,
+  maxDelayMs: 15000,
+};
+
+async function withRetry<T>(fn: () => Promise<T>, retry: Partial<RetryConfig> = {}): Promise<T> {
+  const cfg = { ...DEFAULT_RETRY, ...retry };
+  let lastError: Error | null = null;
+
+  for (let attempt = 0; attempt <= cfg.maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err as Error;
+      if (attempt < cfg.maxRetries) {
+        const delay = Math.min(cfg.baseDelayMs * Math.pow(2, attempt) + Math.random() * 1000, cfg.maxDelayMs);
+        logger.warn({ attempt: attempt + 1, delay: Math.round(delay), error: lastError.message }, 'LLM call failed, retrying');
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+  }
+
+  throw lastError!;
+}
+
+// ── Circuit Breaker ──
+
+interface CircuitState {
+  failures: number;
+  lastFailure: number;
+  open: boolean;
+}
+
+const circuits = new Map<string, CircuitState>();
+const CIRCUIT_THRESHOLD = 5;
+const CIRCUIT_RESET_MS = 60_000;
+
+function checkCircuit(modelId: string): void {
+  const state = circuits.get(modelId);
+  if (!state || !state.open) return;
+  if (Date.now() - state.lastFailure > CIRCUIT_RESET_MS) {
+    state.open = false;
+    state.failures = 0;
+    logger.info({ modelId }, 'Circuit breaker reset');
+    return;
+  }
+  throw new Error(`Circuit breaker open for ${modelId} — too many failures`);
+}
+
+function recordFailure(modelId: string): void {
+  if (!circuits.has(modelId)) circuits.set(modelId, { failures: 0, lastFailure: 0, open: false });
+  const state = circuits.get(modelId)!;
+  state.failures++;
+  state.lastFailure = Date.now();
+  if (state.failures >= CIRCUIT_THRESHOLD) {
+    state.open = true;
+    logger.warn({ modelId, failures: state.failures }, 'Circuit breaker opened');
+  }
+}
+
+function recordSuccess(modelId: string): void {
+  const state = circuits.get(modelId);
+  if (state) { state.failures = 0; state.open = false; }
+}
+
+// ── Main LLM Interface ──
+
 export async function callLlm(options: LlmOptions): Promise<{
   content: string;
   toolCalls: { id: string; name: string; arguments: string }[];
   usage?: { promptTokens: number; completionTokens: number; totalTokens: number };
 }> {
-  const { modelId, fallbackModelId, tools, ...rest } = options;
+  const { modelId, fallbackModelId, tools, systemPrompt, messages, maxTokens, temperature } = options;
 
   const aiTools: Record<string, AiTool> = {};
   for (const tool of tools) {
     aiTools[tool.name] = {
       description: tool.description,
       parameters: tool.parameters as Record<string, unknown>,
-      execute: undefined as unknown as AiTool['execute'], // We handle execution ourselves
+      execute: undefined as unknown as AiTool['execute'],
     };
   }
 
   const models = [modelId, ...(fallbackModelId ? [fallbackModelId] : [])];
-
   let lastError: Error | null = null;
 
-  for (const model of models) {
+  for (const mid of models) {
     try {
-      logger.debug({ model, toolCount: Object.keys(aiTools).length }, 'Calling LLM');
+      checkCircuit(mid);
+      const resolved = resolveModel(mid);
 
-      const result = await generateText({
-        model: getModel(model),
-        system: rest.systemPrompt,
-        messages: rest.messages,
+      // Token budget check (estimate ~4 chars per token for check)
+      const estimatedTokens = Math.ceil(
+        (systemPrompt.length + JSON.stringify(messages).length) / 4 + (maxTokens || 4096)
+      );
+      const budget = tokenBudget.canSpend('global', 'llm-call', estimatedTokens);
+      if (!budget.allowed) {
+        throw new Error(`Token budget: ${budget.reason}`);
+      }
+
+      logger.debug({ model: mid, provider: resolved.providerName, toolCount: Object.keys(aiTools).length }, 'Calling LLM');
+
+      const result = await withRetry(() => generateText({
+        model: resolved.instance,
+        system: systemPrompt,
+        messages,
         tools: Object.keys(aiTools).length > 0 ? aiTools : undefined,
-        maxTokens: rest.maxTokens,
-        temperature: rest.temperature,
-      });
+        maxTokens,
+        temperature,
+      }));
+
+      recordSuccess(mid);
+
+      // Emit token usage event
+      if (result.usage) {
+        eventBus.emit('token:usage', {
+          agentId: 'global',
+          sessionId: 'llm-call',
+          model: mid,
+          promptTokens: result.usage.promptTokens,
+          completionTokens: result.usage.completionTokens,
+          timestamp: Date.now(),
+        });
+      }
 
       const toolCalls = result.toolCalls.map((tc) => ({
         id: tc.toolCallId,
@@ -86,7 +168,8 @@ export async function callLlm(options: LlmOptions): Promise<{
       };
     } catch (err) {
       lastError = err as Error;
-      logger.warn({ model, error: (err as Error).message }, 'LLM call failed, trying fallback');
+      recordFailure(mid);
+      logger.warn({ model: mid, error: lastError.message }, 'LLM call failed');
     }
   }
 
@@ -94,7 +177,7 @@ export async function callLlm(options: LlmOptions): Promise<{
 }
 
 export async function* streamLlm(options: LlmOptions) {
-  const { modelId, tools, ...rest } = options;
+  const { modelId, tools, systemPrompt, messages, maxTokens, temperature } = options;
 
   const aiTools: Record<string, AiTool> = {};
   for (const tool of tools) {
@@ -105,18 +188,25 @@ export async function* streamLlm(options: LlmOptions) {
     };
   }
 
+  const resolved = resolveModel(modelId);
+  checkCircuit(modelId);
+
   const result = streamText({
-    model: getModel(modelId),
-    system: rest.systemPrompt,
-    messages: rest.messages,
+    model: resolved.instance,
+    system: systemPrompt,
+    messages,
     tools: Object.keys(aiTools).length > 0 ? aiTools : undefined,
-    maxTokens: rest.maxTokens,
-    temperature: rest.temperature,
+    maxTokens,
+    temperature,
   });
+
+  let totalInput = 0;
+  let totalOutput = 0;
 
   for await (const chunk of result.fullStream) {
     switch (chunk.type) {
       case 'text-delta':
+        totalOutput += chunk.textDelta.length;
         yield { type: 'delta' as const, content: chunk.textDelta };
         break;
       case 'tool-call':
@@ -128,7 +218,20 @@ export async function* streamLlm(options: LlmOptions) {
         };
         break;
       case 'finish':
+        if (chunk.usage) {
+          totalInput = chunk.usage.promptTokens;
+          totalOutput = chunk.usage.completionTokens;
+          eventBus.emit('token:usage', {
+            agentId: 'global',
+            sessionId: 'llm-stream',
+            model: modelId,
+            promptTokens: totalInput,
+            completionTokens: totalOutput,
+            timestamp: Date.now(),
+          });
+        }
         yield { type: 'done' as const, usage: chunk.usage };
+        recordSuccess(modelId);
         break;
     }
   }

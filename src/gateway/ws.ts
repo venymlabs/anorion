@@ -1,47 +1,75 @@
-import type { Server } from 'node:http';
-import { WebSocketServer, WebSocket } from 'ws';
 import { logger } from '../shared/logger';
+import { eventBus, type EventName } from '../shared/events';
 
-export function setupWebSocket(server: Server) {
-  const wss = new WebSocketServer({ noServer: true });
+type WsClient = { send: (data: string) => void; addEventListener: (type: string, fn: (ev: any) => void) => void; readyState: number };
+const clients = new Map<WsClient, Set<string>>();
 
-  // We check auth inline here since we don't have access to the server's key store
-  server.on('upgrade', (req, socket, head) => {
-    const url = new URL(req.url || '', 'http://localhost');
-    if (url.pathname !== '/ws') {
-      socket.destroy();
-      return;
-    }
+const WS_OPEN = 1;
 
-    // Pass through — auth checked per-message if needed
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit('connection', ws, req);
-    });
-  });
+const AGENT_EVENTS: EventName[] = [
+  'agent:processing',
+  'agent:tool-call',
+  'agent:response',
+  'agent:error',
+  'agent:idle',
+];
 
-  wss.on('connection', (ws) => {
-    logger.info('WebSocket client connected');
+export function handleWebSocket(ws: WsClient) {
+  clients.set(ws, new Set());
+  logger.info('WebSocket client connected');
 
-    ws.on('message', (data) => {
-      try {
-        const msg = JSON.parse(data.toString());
-        logger.debug({ msg }, 'WS message received');
+  ws.addEventListener('message', (event: { data: string }) => {
+    try {
+      const msg = JSON.parse(typeof event.data === 'string' ? event.data : String(event.data));
+      logger.debug({ msg }, 'WS message received');
 
-        if (msg.type === 'subscribe') {
-          ws.send(JSON.stringify({ type: 'subscribed', agents: msg.agents || [] }));
+      if (msg.type === 'subscribe') {
+        const subs = clients.get(ws);
+        if (subs) {
+          const agents = msg.agents || [];
+          for (const a of agents) subs.add(a);
         }
-      } catch {
-        ws.send(JSON.stringify({ type: 'error', message: 'Invalid JSON' }));
+        ws.send(JSON.stringify({ type: 'subscribed', agents: msg.agents || [] }));
       }
-    });
 
-    ws.on('close', () => {
-      logger.info('WebSocket client disconnected');
-    });
+      if (msg.type === 'unsubscribe') {
+        const subs = clients.get(ws);
+        if (subs) {
+          for (const a of msg.agents || []) subs.delete(a);
+        }
+      }
+    } catch {
+      ws.send(JSON.stringify({ type: 'error', message: 'Invalid JSON' }));
+    }
   });
 
-  // Expose for sending events
-  return wss;
+  ws.addEventListener('close', () => {
+    clients.delete(ws);
+    logger.info('WebSocket client disconnected');
+  });
 }
 
-export type { WebSocketServer as WsServer };
+function broadcastEvent(eventName: string, data: any) {
+  const payload = JSON.stringify({ type: eventName, ...data });
+  for (const [ws, subs] of clients) {
+    if ((ws as any).readyState !== WS_OPEN) continue;
+    // If client subscribed to specific agents, filter; else send all
+    if (subs.size > 0 && data.agentId && !subs.has(data.agentId)) continue;
+    ws.send(payload);
+  }
+}
+
+// Subscribe to all agent events from the event bus
+for (const ev of AGENT_EVENTS) {
+  eventBus.on(ev, (data: any) => broadcastEvent(ev, data));
+}
+
+/** Broadcast a raw message to all connected WebSocket clients */
+export function broadcast(message: object) {
+  const data = JSON.stringify(message);
+  for (const ws of clients.keys()) {
+    if ((ws as any).readyState === WS_OPEN) {
+      ws.send(data);
+    }
+  }
+}

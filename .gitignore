@@ -1,8 +1,7 @@
-node_modules
-dist
+node_modules/
+data/
+*.db
 .env
 .env.local
-data/*.db
-*.log
+dist/
 .DS_Store
-data/*.db*

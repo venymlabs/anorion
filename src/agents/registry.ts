@@ -1,8 +1,6 @@
 import type { AgentConfig, Agent } from '../shared/types';
 import type { Db } from '../shared/db';
-import { agents } from '../shared/db/schema';
-import { eq } from 'drizzle-orm';
-import { nanoid } from 'nanoid';
+import type { PreparedStatements } from '../shared/db/prepared';
 import { readFileSync, readdirSync, existsSync } from 'fs';
 import { resolve } from 'path';
 import { parse as parseYaml } from 'yaml';
@@ -11,9 +9,11 @@ import { logger } from '../shared/logger';
 class AgentRegistry {
   private agents = new Map<string, Agent>();
   private db: Db | null = null;
+  private prepared: PreparedStatements | null = null;
 
-  setDb(db: Db): void {
+  setDb(db: Db, prepared: PreparedStatements): void {
     this.db = db;
+    this.prepared = prepared;
   }
 
   async loadFromDirectory(dir: string): Promise<void> {
@@ -30,7 +30,7 @@ class AgentRegistry {
         const parsed = parseYaml(raw) as Partial<AgentConfig>;
         if (!parsed.name) continue;
         await this.create({
-          id: parsed.id || nanoid(10),
+          id: parsed.id || crypto.randomUUID().slice(0, 10),
           name: parsed.name,
           model: parsed.model || 'openai/gpt-4o',
           systemPrompt: parsed.systemPrompt || 'You are a helpful assistant.',
@@ -50,7 +50,7 @@ class AgentRegistry {
     const now = new Date().toISOString();
     const agent: Agent = {
       ...config,
-      id: config.id || nanoid(10),
+      id: config.id || crypto.randomUUID().slice(0, 10),
       state: 'idle',
       createdAt: now,
       updatedAt: now,
@@ -58,24 +58,21 @@ class AgentRegistry {
 
     this.agents.set(agent.id, agent);
 
-    if (this.db) {
-      await this.db.insert(agents).values({
-        id: agent.id,
-        name: agent.name,
-        model: agent.model,
-        fallbackModel: agent.fallbackModel,
-        systemPrompt: agent.systemPrompt,
-        tools: JSON.stringify(agent.tools),
-        maxIterations: agent.maxIterations,
-        timeoutMs: agent.timeoutMs,
-        state: agent.state,
-        tags: JSON.stringify(agent.tags || []),
-        metadata: JSON.stringify(agent.metadata || {}),
-        createdAt: agent.createdAt,
-        updatedAt: agent.updatedAt,
-      }).onConflictDoUpdate({
-        target: agents.id,
-        set: { updatedAt: now },
+    if (this.prepared) {
+      this.prepared.agentInsert.run({
+        $id: agent.id,
+        $name: agent.name,
+        $model: agent.model,
+        $fallbackModel: agent.fallbackModel ?? null,
+        $systemPrompt: agent.systemPrompt,
+        $tools: JSON.stringify(agent.tools),
+        $maxIterations: agent.maxIterations ?? null,
+        $timeoutMs: agent.timeoutMs ?? null,
+        $state: agent.state,
+        $tags: JSON.stringify(agent.tags || []),
+        $metadata: JSON.stringify(agent.metadata || {}),
+        $createdAt: agent.createdAt,
+        $updatedAt: agent.updatedAt,
       });
     }
 
@@ -109,19 +106,20 @@ class AgentRegistry {
 
     this.agents.set(id, updated);
 
-    if (this.db) {
-      await this.db.update(agents).set({
-        name: updated.name,
-        model: updated.model,
-        fallbackModel: updated.fallbackModel,
-        systemPrompt: updated.systemPrompt,
-        tools: JSON.stringify(updated.tools),
-        maxIterations: updated.maxIterations,
-        timeoutMs: updated.timeoutMs,
-        tags: JSON.stringify(updated.tags || []),
-        metadata: JSON.stringify(updated.metadata || {}),
-        updatedAt: updated.updatedAt,
-      }).where(eq(agents.id, id));
+    if (this.prepared) {
+      this.prepared.agentUpdate.run({
+        $id,
+        $name: updated.name,
+        $model: updated.model,
+        $fallbackModel: updated.fallbackModel ?? null,
+        $systemPrompt: updated.systemPrompt,
+        $tools: JSON.stringify(updated.tools),
+        $maxIterations: updated.maxIterations ?? null,
+        $timeoutMs: updated.timeoutMs ?? null,
+        $tags: JSON.stringify(updated.tags || []),
+        $metadata: JSON.stringify(updated.metadata || {}),
+        $updatedAt: updated.updatedAt,
+      });
     }
 
     logger.info({ agent: updated.name, id }, 'Agent updated');
@@ -134,8 +132,8 @@ class AgentRegistry {
 
     this.agents.delete(id);
 
-    if (this.db) {
-      await this.db.delete(agents).where(eq(agents.id, id));
+    if (this.prepared) {
+      this.prepared.agentDelete.run({ $id: id });
     }
 
     logger.info({ agent: existing.name, id }, 'Agent deleted');

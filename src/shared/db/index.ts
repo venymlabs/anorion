@@ -3,11 +3,18 @@ import { drizzle } from 'drizzle-orm/bun-sqlite';
 import { resolve } from 'path';
 import { mkdirSync } from 'fs';
 import * as schema from './schema';
+import { PreparedStatements } from './prepared';
 import { logger } from '../logger';
 
 export type Db = ReturnType<typeof drizzle<typeof schema>>;
 
-export function initDatabase(dbPath: string): Db {
+export interface DatabaseResult {
+  db: Db;
+  raw: Database;
+  prepared: PreparedStatements;
+}
+
+export function initDatabase(dbPath: string): DatabaseResult {
   const fullPath = resolve(process.cwd(), dbPath);
   const dir = fullPath.slice(0, fullPath.lastIndexOf('/'));
   mkdirSync(dir, { recursive: true });
@@ -15,6 +22,10 @@ export function initDatabase(dbPath: string): Db {
   const sqlite = new Database(fullPath);
   sqlite.exec('PRAGMA journal_mode = WAL');
   sqlite.exec('PRAGMA foreign_keys = ON');
+  sqlite.exec('PRAGMA synchronous = NORMAL');
+  sqlite.exec('PRAGMA cache_size = -20000');
+  sqlite.exec('PRAGMA temp_store = MEMORY');
+  sqlite.exec('PRAGMA mmap_size = 268435456');
 
   const db = drizzle(sqlite, { schema });
 
@@ -102,12 +113,53 @@ export function initDatabase(dbPath: string): Db {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    -- Existing indexes
     CREATE INDEX IF NOT EXISTS idx_sessions_agent ON sessions(agent_id);
     CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_messages_agent ON messages(agent_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_memory_agent ON memory_entries(agent_id);
+
+    -- Missing indexes
+    CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
+    CREATE INDEX IF NOT EXISTS idx_sessions_last_active ON sessions(last_active);
+    CREATE INDEX IF NOT EXISTS idx_sessions_channel ON sessions(channel_id);
+    CREATE INDEX IF NOT EXISTS idx_schedules_agent ON schedules(agent_id);
+    CREATE INDEX IF NOT EXISTS idx_schedules_enabled ON schedules(enabled);
+    CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
+
+    -- Ensure unique index on (agent_id, key) for upsert support
+    DROP INDEX IF EXISTS idx_memory_agent_key;
+    CREATE UNIQUE INDEX idx_memory_agent_key ON memory_entries(agent_id, key);
   `);
 
+  // FTS5 full-text search for memory entries (external content with sync triggers)
+  sqlite.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+      key, value, category,
+      content='memory_entries',
+      content_rowid='rowid'
+    );
+
+    CREATE TRIGGER IF NOT EXISTS memory_fts_ai AFTER INSERT ON memory_entries BEGIN
+      INSERT INTO memory_fts(rowid, key, value, category)
+        VALUES (new.rowid, new.key, new.value, new.category);
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS memory_fts_ad AFTER DELETE ON memory_entries BEGIN
+      INSERT INTO memory_fts(memory_fts, rowid, key, value, category)
+        VALUES ('delete', old.rowid, old.key, old.value, old.category);
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS memory_fts_au AFTER UPDATE ON memory_entries BEGIN
+      INSERT INTO memory_fts(memory_fts, rowid, key, value, category)
+        VALUES ('delete', old.rowid, old.key, old.value, old.category);
+      INSERT INTO memory_fts(rowid, key, value, category)
+        VALUES (new.rowid, new.key, new.value, new.category);
+    END;
+  `);
+
+  const prepared = new PreparedStatements(sqlite);
+
   logger.info({ path: fullPath }, 'Database initialized');
-  return db;
+  return { db, raw: sqlite, prepared };
 }

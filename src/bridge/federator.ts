@@ -22,13 +22,15 @@ interface RemoteAgent {
   gatewayId: string;
 }
 
+const MAX_QUEUE_SIZE = 100;
+
 export class Federator {
   private ownGatewayId: string;
   private secret: string;
   private clients = new Map<string, BridgeClient>(); // url -> client
   private bridgeServer: BridgeServer;
   private messageQueue: Array<{ targetAgentId: string; payload: MessageForwardPayload; resolve: (v: unknown) => void; reject: (e: Error) => void }> = [];
-  private stats = { messagesForwarded: 0, messagesReceived: 0, startTime: Date.now() };
+  private stats = { messagesForwarded: 0, messagesReceived: 0, queueDropped: 0, startTime: Date.now() };
 
   constructor(ownGatewayId: string, secret: string, bridgeServer: BridgeServer) {
     this.ownGatewayId = ownGatewayId;
@@ -115,6 +117,15 @@ export class Federator {
     }
 
     // Queue if not found (maybe agent will appear)
+    if (this.messageQueue.length >= MAX_QUEUE_SIZE) {
+      // Drop the oldest queued message to cap memory
+      const oldest = this.messageQueue.shift();
+      if (oldest) {
+        oldest.reject(new Error('Message dropped: queue full'));
+        this.stats.queueDropped++;
+      }
+    }
+
     return new Promise((resolve, reject) => {
       this.messageQueue.push({ targetAgentId, payload: { targetAgentId, text, sessionId, channelId }, resolve, reject });
       // Auto-reject after 30s
@@ -200,8 +211,10 @@ export class Federator {
     return {
       enabled: true,
       peerCount: this.clients.size + this.bridgeServer.getConnections().size,
+      queueSize: this.messageQueue.length,
       messagesForwarded: this.stats.messagesForwarded,
       messagesReceived: this.stats.messagesReceived,
+      queueDropped: this.stats.queueDropped,
       uptime: Date.now() - this.stats.startTime,
     };
   }

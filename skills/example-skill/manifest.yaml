@@ -1,0 +1,9 @@
+name: example-skill
+version: 1.0.0
+description: "Example skill demonstrating the plugin system"
+author: Anorion
+tools:
+  - current-time
+  - uuid-gen
+defaultConfig:
+  timezone: UTC
