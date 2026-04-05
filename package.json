@@ -1,6 +1,6 @@
 {
   "name": "anorion",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "The open-source agent gateway — connect any LLM to any channel",
   "keywords": [
     "ai",
