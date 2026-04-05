@@ -132,6 +132,40 @@ export function initDatabase(dbPath: string): DatabaseResult {
     CREATE UNIQUE INDEX idx_memory_agent_key ON memory_entries(agent_id, key);
   `);
 
+  // FTS5 full-text search for messages
+  sqlite.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+      content,
+      content='messages',
+      content_rowid='rowid'
+    );
+
+    CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
+      INSERT INTO messages_fts(rowid, content)
+        VALUES (new.rowid, new.content);
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
+      INSERT INTO messages_fts(messages_fts, rowid, content)
+        VALUES ('delete', old.rowid, old.content);
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE ON messages BEGIN
+      INSERT INTO messages_fts(messages_fts, rowid, content)
+        VALUES ('delete', old.rowid, old.content);
+      INSERT INTO messages_fts(rowid, content)
+        VALUES (new.rowid, new.content);
+    END;
+
+    -- Config snapshots table
+    CREATE TABLE IF NOT EXISTS config_snapshots (
+      id TEXT PRIMARY KEY,
+      config TEXT NOT NULL,
+      reason TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+
   // FTS5 full-text search for memory entries (external content with sync triggers)
   sqlite.exec(`
     CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(

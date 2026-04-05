@@ -41,6 +41,7 @@ class AgentRegistry {
           timeoutMs: parsed.timeoutMs || 120000,
           tags: parsed.tags,
           metadata: parsed.metadata,
+          handoffs: parsed.handoffs,
         });
       } catch (err) {
         logger.error({ file, error: (err as Error).message }, 'Failed to load agent YAML');

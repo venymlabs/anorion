@@ -11,6 +11,16 @@ import { logger } from '../shared/logger';
 import { scheduleManager } from '../scheduler/cron';
 import { memoryManager } from '../memory/store';
 import { spawnSubAgent, listChildren, killChild } from '../agents/subagent';
+import { authMiddleware, rateLimitPerKey } from '../auth/middleware';
+import { extractTraceContext, generateSpanId, storeTrace, type RequestTrace } from '../observability/tracer';
+import { metricsCollector } from '../observability/metrics';
+import { searchEngine } from '../search/engine';
+import { configVersioning } from '../config/versioning';
+import { setPreparedForMessages } from './routes-messages';
+import { UPLOAD_DIR } from './routes-upload';
+import { setWsAuth } from './ws';
+import { existsSync, mkdirSync } from 'fs';
+import { resolve } from 'path';
 
 const app = new Hono();
 
@@ -78,73 +88,76 @@ function validate<T>(schema: z.ZodSchema<T>, data: unknown): { success: true; da
   return { success: false, error: result.error.flatten() };
 }
 
-// ── Rate Limiting ──
+// ── CORS (configurable origins) ──
+let corsOrigins: string | string[] = '*';
 
-interface RateBucket {
-  timestamps: number[];
+export function setCorsOrigins(origins: string | string[]) {
+  corsOrigins = origins;
 }
 
-const rateBuckets = new Map<string, RateBucket>();
+app.use('*', cors({
+  origin: corsOrigins,
+  allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowHeaders: ['Content-Type', 'Authorization', 'X-API-Key'],
+  exposeHeaders: ['X-RateLimit-Limit', 'X-RateLimit-Remaining', 'X-RateLimit-Reset'],
+  maxAge: 86400,
+}));
 
-function rateLimit(maxRequests: number, windowMs: number) {
-  return async (c: any, next: any) => {
-    const ip = c.req.header('x-forwarded-for')?.split(',')[0]?.trim()
-      || c.req.header('x-real-ip')
-      || c.req.header('cf-connecting-ip')
-      || 'unknown';
-
-    const now = Date.now();
-    const bucket = rateBuckets.get(ip) || { timestamps: [] };
-
-    // Slide window: keep only timestamps within window
-    bucket.timestamps = bucket.timestamps.filter((t: number) => now - t < windowMs);
-
-    if (bucket.timestamps.length >= maxRequests) {
-      const oldest = bucket.timestamps[0]!;
-      const retryAfter = Math.ceil((oldest + windowMs - now) / 1000);
-      return c.json({ error: 'Rate limit exceeded' }, 429, { 'Retry-After': String(retryAfter) });
-    }
-
-    bucket.timestamps.push(now);
-    rateBuckets.set(ip, bucket);
-
-    return next();
-  };
-}
-
-const messageRateLimit = rateLimit(60, 60_000);  // 60 req/min
-const readRateLimit = rateLimit(120, 60_000);     // 120 req/min
-
-// ── CORS ──
-app.use('*', cors());
-
-// ── Auth Middleware ──
-
-const validKeys = new Map<string, string[]>();
-export function setApiKeys(keys: { name: string; key: string; scopes: string[] }[]) {
-  for (const k of keys) {
-    validKeys.set(k.key, k.scopes);
-  }
-}
-
-const noAuthPaths = ['/health'];
-
+// ── Tracing middleware — wraps every request with a trace ──
 app.use('*', async (c, next) => {
-  if (noAuthPaths.includes(c.req.path)) return next();
+  const { traceId, parentSpanId } = extractTraceContext(c);
+  const spanId = generateSpanId();
 
-  const hasRealKeys = [...validKeys.keys()].some((k) => k !== 'anorion-dev-key');
-  if (!hasRealKeys) return next();
+  const trace: RequestTrace = {
+    traceId,
+    parentSpanId,
+    spanId,
+    startTime: Date.now(),
+    method: c.req.method,
+    path: c.req.path,
+  };
 
-  const apiKey = c.req.header('X-API-Key');
-  if (!apiKey || !validKeys.has(apiKey)) {
-    return c.json({ error: 'Unauthorized' }, 401);
+  c.set('trace', trace);
+
+  // Propagate trace ID in response headers
+  c.header('X-Trace-Id', traceId);
+
+  // Rate limit response headers (informational)
+  c.header('X-RateLimit-Limit', '120');
+  c.header('X-RateLimit-Remaining', '119');
+  c.header('X-RateLimit-Reset', String(Math.ceil((Date.now() + 60000) / 1000)));
+
+  const startMs = performance.now();
+  try {
+    await next();
+  } catch (err) {
+    trace.error = (err as Error).message;
+    metricsCollector.recordError(c.req.path, 500, (err as Error).message);
+    throw err;
+  } finally {
+    const durationMs = Math.round(performance.now() - startMs);
+    trace.endTime = Date.now();
+    trace.durationMs = durationMs;
+    trace.statusCode = c.res?.status;
+
+    // Store trace (skip high-frequency health checks)
+    if (c.req.path !== '/health' && c.req.path !== '/api/v1/health') {
+      storeTrace(trace);
+      metricsCollector.recordLatency(durationMs, c.req.path);
+    }
   }
-
-  return next();
 });
 
+// ── Auth Middleware (applied globally) ──
+app.use('*', authMiddleware);
+
+// ── Rate limiting (applied per-key after auth) ──
+app.use('/api/v1/agents/*', rateLimitPerKey());
+app.use('/api/v1/schedules/*', rateLimitPerKey());
+app.use('/api/v1/memory/*', rateLimitPerKey());
+
 // ── Health ──
-app.get('/health', readRateLimit, (c) => c.json({
+app.get('/health', (c) => c.json({
   status: 'ok',
   uptime: process.uptime(),
   timestamp: new Date().toISOString(),
@@ -153,11 +166,11 @@ app.get('/health', readRateLimit, (c) => c.json({
 
 // ── Agents ──
 
-app.get('/api/v1/agents', readRateLimit, (c) => {
+app.get('/api/v1/agents', (c) => {
   return c.json({ agents: agentRegistry.list() });
 });
 
-app.post('/api/v1/agents', messageRateLimit, async (c) => {
+app.post('/api/v1/agents', async (c) => {
   const body = await c.req.json();
   const parsed = validate(CreateAgentSchema, body);
   if (!parsed.success) {
@@ -188,13 +201,13 @@ function resolveAgent(idOrName: string) {
   return agentRegistry.get(idOrName) || agentRegistry.getByName(idOrName);
 }
 
-app.get('/api/v1/agents/:id', readRateLimit, (c) => {
+app.get('/api/v1/agents/:id', (c) => {
   const agent = resolveAgent(c.req.param('id'));
   if (!agent) return c.json({ error: 'Agent not found' }, 404);
   return c.json({ agent });
 });
 
-app.patch('/api/v1/agents/:id', messageRateLimit, async (c) => {
+app.patch('/api/v1/agents/:id', async (c) => {
   const body = await c.req.json();
   const parsed = validate(UpdateAgentSchema, body);
   if (!parsed.success) {
@@ -212,7 +225,7 @@ app.patch('/api/v1/agents/:id', messageRateLimit, async (c) => {
   return c.json({ agent: updated });
 });
 
-app.delete('/api/v1/agents/:id', messageRateLimit, async (c) => {
+app.delete('/api/v1/agents/:id', async (c) => {
   const agent = resolveAgent(c.req.param('id'));
   if (!agent) return c.json({ error: 'Agent not found' }, 404);
   await agentRegistry.delete(agent.id);
@@ -221,7 +234,7 @@ app.delete('/api/v1/agents/:id', messageRateLimit, async (c) => {
 
 // ── SSE Streaming Endpoint ──
 
-app.post('/api/v1/agents/:id/stream', messageRateLimit, async (c) => {
+app.post('/api/v1/agents/:id/stream', async (c) => {
   const body = await c.req.json();
   const parsed = validate(StreamSchema, body);
   if (!parsed.success) {
@@ -264,7 +277,7 @@ app.post('/api/v1/agents/:id/stream', messageRateLimit, async (c) => {
 
 // ── Messages ──
 
-app.post('/api/v1/agents/:id/messages', messageRateLimit, async (c) => {
+app.post('/api/v1/agents/:id/messages', async (c) => {
   const body = await c.req.json();
   const parsed = validate(SendMessageSchema, body);
   if (!parsed.success) {
@@ -288,7 +301,7 @@ app.post('/api/v1/agents/:id/messages', messageRateLimit, async (c) => {
   }
 });
 
-app.get('/api/v1/agents/:id/sessions', readRateLimit, async (c) => {
+app.get('/api/v1/agents/:id/sessions', async (c) => {
   const agent = resolveAgent(c.req.param('id'));
   if (!agent) return c.json({ error: 'Agent not found' }, 404);
   const sessions = await sessionManager.listByAgent(agent.id);
@@ -297,7 +310,7 @@ app.get('/api/v1/agents/:id/sessions', readRateLimit, async (c) => {
 
 // ── Tools ──
 
-app.get('/api/v1/tools', readRateLimit, (c) => {
+app.get('/api/v1/tools', (c) => {
   return c.json({
     tools: toolRegistry.list().map((t) => ({
       name: t.name,
@@ -310,18 +323,18 @@ app.get('/api/v1/tools', readRateLimit, (c) => {
 
 // ── Channels ──
 
-app.get('/api/v1/channels', readRateLimit, (c) => {
+app.get('/api/v1/channels', (c) => {
   return c.json({ channels: channelRouter.listChannels() });
 });
 
-app.post('/api/v1/channels/:name/start', messageRateLimit, async (c) => {
+app.post('/api/v1/channels/:name/start', async (c) => {
   const name = c.req.param('name');
   const ok = await channelRouter.startChannel(name);
   if (!ok) return c.json({ error: `Channel not found: ${name}` }, 404);
   return c.json({ ok: true, channel: name });
 });
 
-app.post('/api/v1/channels/:name/stop', messageRateLimit, async (c) => {
+app.post('/api/v1/channels/:name/stop', async (c) => {
   const name = c.req.param('name');
   const ok = await channelRouter.stopChannel(name);
   if (!ok) return c.json({ error: `Channel not found: ${name}` }, 404);
@@ -330,7 +343,7 @@ app.post('/api/v1/channels/:name/stop', messageRateLimit, async (c) => {
 
 // ── Schedules ──
 
-app.post('/api/v1/schedules', messageRateLimit, async (c) => {
+app.post('/api/v1/schedules', async (c) => {
   const body = await c.req.json();
   const parsed = validate(CreateScheduleSchema, body);
   if (!parsed.success) {
@@ -347,15 +360,15 @@ app.post('/api/v1/schedules', messageRateLimit, async (c) => {
   }
 });
 
-app.get('/api/v1/schedules', readRateLimit, (c) => c.json({ schedules: scheduleManager.list() }));
+app.get('/api/v1/schedules', (c) => c.json({ schedules: scheduleManager.list() }));
 
-app.get('/api/v1/schedules/:id', readRateLimit, (c) => {
+app.get('/api/v1/schedules/:id', (c) => {
   const job = scheduleManager.get(c.req.param('id'));
   if (!job) return c.json({ error: 'Schedule not found' }, 404);
   return c.json({ schedule: job });
 });
 
-app.patch('/api/v1/schedules/:id', messageRateLimit, async (c) => {
+app.patch('/api/v1/schedules/:id', async (c) => {
   const body = await c.req.json();
   try {
     const updated = await scheduleManager.update(c.req.param('id'), body);
@@ -366,13 +379,13 @@ app.patch('/api/v1/schedules/:id', messageRateLimit, async (c) => {
   }
 });
 
-app.delete('/api/v1/schedules/:id', messageRateLimit, async (c) => {
+app.delete('/api/v1/schedules/:id', async (c) => {
   const ok = await scheduleManager.remove(c.req.param('id'));
   if (!ok) return c.json({ error: 'Schedule not found' }, 404);
   return c.json({ ok: true });
 });
 
-app.post('/api/v1/schedules/:id/trigger', messageRateLimit, async (c) => {
+app.post('/api/v1/schedules/:id/trigger', async (c) => {
   const result = await scheduleManager.trigger(c.req.param('id'));
   if (!result.success) return c.json({ error: result.error }, 404);
   return c.json({ triggered: true });
@@ -380,13 +393,13 @@ app.post('/api/v1/schedules/:id/trigger', messageRateLimit, async (c) => {
 
 // ── Memory ──
 
-app.get('/api/v1/agents/:id/memory', readRateLimit, (c) => {
+app.get('/api/v1/agents/:id/memory', (c) => {
   const agent = resolveAgent(c.req.param('id'));
   if (!agent) return c.json({ error: 'Agent not found' }, 404);
   return c.json({ memories: memoryManager.load(agent.id) });
 });
 
-app.post('/api/v1/agents/:id/memory', messageRateLimit, async (c) => {
+app.post('/api/v1/agents/:id/memory', async (c) => {
   const agent = resolveAgent(c.req.param('id'));
   if (!agent) return c.json({ error: 'Agent not found' }, 404);
   const body = await c.req.json();
@@ -398,14 +411,14 @@ app.post('/api/v1/agents/:id/memory', messageRateLimit, async (c) => {
   return c.json({ memory: entry }, 201);
 });
 
-app.post('/api/v1/agents/:id/memory/search', readRateLimit, async (c) => {
+app.post('/api/v1/agents/:id/memory/search', async (c) => {
   const agent = resolveAgent(c.req.param('id'));
   if (!agent) return c.json({ error: 'Agent not found' }, 404);
   const body = await c.req.json();
   return c.json({ memories: memoryManager.search(agent.id, body.query || '') });
 });
 
-app.delete('/api/v1/agents/:id/memory/:key', messageRateLimit, (c) => {
+app.delete('/api/v1/agents/:id/memory/:key', (c) => {
   const agent = resolveAgent(c.req.param('id'));
   if (!agent) return c.json({ error: 'Agent not found' }, 404);
   const ok = memoryManager.forget(agent.id, c.req.param('key'));
@@ -415,13 +428,13 @@ app.delete('/api/v1/agents/:id/memory/:key', messageRateLimit, (c) => {
 
 // ── Sub-agents ──
 
-app.get('/api/v1/agents/:id/children', readRateLimit, (c) => {
+app.get('/api/v1/agents/:id/children', (c) => {
   const agent = resolveAgent(c.req.param('id'));
   if (!agent) return c.json({ error: 'Agent not found' }, 404);
   return c.json({ children: listChildren(agent.id) });
 });
 
-app.post('/api/v1/agents/:id/spawn', messageRateLimit, async (c) => {
+app.post('/api/v1/agents/:id/spawn', async (c) => {
   const agent = resolveAgent(c.req.param('id'));
   if (!agent) return c.json({ error: 'Agent not found' }, 404);
   const body = await c.req.json();
@@ -442,12 +455,46 @@ app.post('/api/v1/agents/:id/spawn', messageRateLimit, async (c) => {
   }
 });
 
-app.delete('/api/v1/agents/:id/children/:childId', messageRateLimit, (c) => {
+app.delete('/api/v1/agents/:id/children/:childId', (c) => {
   const agent = resolveAgent(c.req.param('id'));
   if (!agent) return c.json({ error: 'Agent not found' }, 404);
   const ok = killChild(agent.id, c.req.param('childId'));
   if (!ok) return c.json({ error: 'Child not found' }, 404);
   return c.json({ ok: true });
+});
+
+// ── Config Versioning ──
+
+app.get('/api/v1/config/history', (c) => {
+  const snapshots = configVersioning.list(Number(c.req.query('limit')) || 50);
+  return c.json({ snapshots });
+});
+
+app.get('/api/v1/config/history/:id', (c) => {
+  const snapshot = configVersioning.get(c.req.param('id'));
+  if (!snapshot) return c.json({ error: 'Snapshot not found' }, 404);
+  return c.json({ snapshot });
+});
+
+app.post('/api/v1/config/snapshot', (c) => {
+  const id = configVersioning.save(c.req.query('reason') || undefined);
+  return c.json({ id }, 201);
+});
+
+app.post('/api/v1/config/rollback/:id', (c) => {
+  const snapshot = configVersioning.rollback(c.req.param('id'));
+  if (!snapshot) return c.json({ error: 'Snapshot not found' }, 404);
+  return c.json({ snapshot, ok: true });
+});
+
+// ── Static file serving for uploads ──
+app.get('/uploads/*', async (c) => {
+  const filePath = resolve(UPLOAD_DIR, c.req.path.replace('/uploads/', ''));
+  const file = Bun.file(filePath);
+  if (!(await file.exists())) {
+    return c.json({ error: 'File not found' }, 404);
+  }
+  return new Response(file);
 });
 
 // ── Bridge ──
@@ -506,6 +553,41 @@ export function registerBridgeRoutes(hono: Hono) {
       return c.json({ error: (err as Error).message }, 500);
     }
   });
+}
+
+// ── Register Auth & Observability sub-routers ──
+
+import authRoutes from '../auth/routes';
+import observabilityRoutes from '../observability/routes';
+import routesV2 from './routes-v2';
+import routesMessages from './routes-messages';
+import routesSearch from './routes-search';
+import routesUpload from './routes-upload';
+
+app.route('/', authRoutes);
+app.route('/', observabilityRoutes);
+app.route('/', routesV2);
+app.route('/', routesMessages);
+app.route('/', routesSearch);
+app.route('/', routesUpload);
+
+/** Initialize gateway sub-systems (upload dir). DB wiring is done via setGatewayDb. */
+export function initGatewayModules() {
+  if (!existsSync(UPLOAD_DIR)) {
+    mkdirSync(UPLOAD_DIR, { recursive: true });
+  }
+}
+
+/** Wire up prepared statements to all sub-systems. */
+export function setGatewayDb(
+  prepared: import('../shared/db/prepared').PreparedStatements,
+  rawDb: import('bun:sqlite').Database,
+  configPath?: string,
+) {
+  setPreparedForMessages(prepared);
+  searchEngine.setPrepared(prepared);
+  searchEngine.setRawDb(rawDb);
+  configVersioning.init(prepared, configPath || '');
 }
 
 export default app;

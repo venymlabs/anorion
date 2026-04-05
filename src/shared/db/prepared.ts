@@ -27,6 +27,23 @@ export class PreparedStatements {
   readonly scheduleSetLastRun: Statement;
   readonly scheduleGetAll: Statement;
 
+  // Sessions — paginated listing
+  readonly sessionListPaginated: Statement;
+  readonly sessionCount: Statement;
+  readonly sessionDelete: Statement;
+
+  // Messages — paginated listing with cursor
+  readonly messageListBySessionPaginated: Statement;
+  readonly messageCountBySession: Statement;
+
+  // Message search via FTS5
+  readonly messageSearch: Statement;
+
+  // Config snapshots
+  readonly configSnapshotInsert: Statement;
+  readonly configSnapshotList: Statement;
+  readonly configSnapshotGet: Statement;
+
   constructor(db: BunDatabase) {
     // Agents
     this.agentInsert = db.prepare(
@@ -106,6 +123,66 @@ export class PreparedStatements {
 
     this.scheduleGetAll = db.prepare(
       `SELECT * FROM schedules`,
+    );
+
+    // Sessions — paginated listing with optional filters
+    this.sessionListPaginated = db.prepare(
+      `SELECT * FROM sessions
+       WHERE ($agentId IS NULL OR agent_id = $agentId)
+         AND ($status IS NULL OR status = $status)
+       ORDER BY created_at DESC
+       LIMIT $limit OFFSET $offset`,
+    );
+
+    this.sessionCount = db.prepare(
+      `SELECT COUNT(*) as total FROM sessions
+       WHERE ($agentId IS NULL OR agent_id = $agentId)
+         AND ($status IS NULL OR status = $status)`,
+    );
+
+    this.sessionDelete = db.prepare(
+      `DELETE FROM sessions WHERE id = $id`,
+    );
+
+    // Messages — paginated listing with cursor support
+    this.messageListBySessionPaginated = db.prepare(
+      `SELECT * FROM messages
+       WHERE session_id = $sessionId
+         AND ($after IS NULL OR created_at > $after)
+         AND ($before IS NULL OR created_at < $before)
+       ORDER BY created_at ASC
+       LIMIT $limit`,
+    );
+
+    this.messageCountBySession = db.prepare(
+      `SELECT COUNT(*) as total FROM messages WHERE session_id = $sessionId`,
+    );
+
+    // Message search via FTS5
+    this.messageSearch = db.prepare(
+      `SELECT m.*, fts.rank
+       FROM messages_fts fts
+       JOIN messages m ON m.rowid = fts.rowid
+       JOIN sessions s ON s.id = m.session_id
+       WHERE messages_fts MATCH $query
+         AND ($agentId IS NULL OR m.agent_id = $agentId)
+         AND ($sessionId IS NULL OR m.session_id = $sessionId)
+       ORDER BY fts.rank
+       LIMIT $limit`,
+    );
+
+    // Config snapshots
+    this.configSnapshotInsert = db.prepare(
+      `INSERT INTO config_snapshots (id, config, reason, created_at)
+       VALUES ($id, $config, $reason, $createdAt)`,
+    );
+
+    this.configSnapshotList = db.prepare(
+      `SELECT * FROM config_snapshots ORDER BY created_at DESC LIMIT $limit`,
+    );
+
+    this.configSnapshotGet = db.prepare(
+      `SELECT * FROM config_snapshots WHERE id = $id`,
     );
   }
 }

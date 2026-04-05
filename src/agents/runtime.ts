@@ -23,6 +23,8 @@ import { memoryManager } from '../memory/store';
 import { eventBus } from '../shared/events';
 import { resolveModel } from '../llm/providers';
 import { jsonSchema } from '@ai-sdk/provider-utils';
+import { registerHandoffTools, getHandoffToolNames } from './handoff';
+import type { AgentHandoffConfig } from '../shared/types';
 
 // ── Interfaces ──
 
@@ -178,6 +180,14 @@ export async function sendMessage(input: SendMessageInput): Promise<SendMessageR
   const agentId = agent.id;
 
   agentRegistry.setState(agentId, 'processing');
+
+  // Register handoff tools if agent has handoffs configured
+  if (agent.handoffs && agent.handoffs.length > 0) {
+    registerHandoffTools(agentId, agent.handoffs.map((h: AgentHandoffConfig) => ({
+      targetAgentId: h.targetAgentId,
+      description: h.description,
+    })));
+  }
 
   const abortController = new AbortController();
   const signal = input.abortSignal ?? abortController.signal;

@@ -1,0 +1,12 @@
+{
+  "/_not-found/page": "app/_not-found/page.js",
+  "/agents/[id]/edit/page": "app/agents/[id]/edit/page.js",
+  "/agents/[id]/page": "app/agents/[id]/page.js",
+  "/agents/new/page": "app/agents/new/page.js",
+  "/agents/page": "app/agents/page.js",
+  "/chat/page": "app/chat/page.js",
+  "/page": "app/page.js",
+  "/sessions/page": "app/sessions/page.js",
+  "/settings/page": "app/settings/page.js",
+  "/tools/page": "app/tools/page.js"
+}

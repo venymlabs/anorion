@@ -1,0 +1,16 @@
+{
+  "name": "@anorion/client",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for the Anorion agent platform",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.5.0"
+  }
+}

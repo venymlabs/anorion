@@ -1,5 +1,12 @@
 // Core types for Anorion
 
+export interface AgentHandoffConfig {
+  /** Target agent ID or name */
+  targetAgentId: string;
+  /** Description of when to hand off (LLM uses this to decide) */
+  description: string;
+}
+
 export interface AgentConfig {
   id: string;
   name: string;
@@ -11,6 +18,8 @@ export interface AgentConfig {
   timeoutMs?: number;
   tags?: string[];
   metadata?: Record<string, unknown>;
+  /** Agent handoffs — declares which agents this agent can transfer to */
+  handoffs?: AgentHandoffConfig[];
 }
 
 export type AgentState = 'idle' | 'processing' | 'waiting' | 'error';
