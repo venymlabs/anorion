@@ -7102,16 +7102,10 @@ var require_dist = __commonJS((exports) => {
 // src/cli/index.ts
 var import_picocolors = __toESM(require_picocolors(), 1);
 import { existsSync } from "node:fs";
-import { resolve, dirname } from "node:path";
+import { resolve } from "node:path";
 import { readFileSync } from "node:fs";
 function getVersion() {
-  try {
-    const pkgPath = resolve(dirname(import.meta.url.replace("file://", "")), "../../package.json");
-    const pkg2 = JSON.parse(readFileSync(pkgPath, "utf-8"));
-    return pkg2.version || "0.2.1";
-  } catch {
-    return pkg.version || "0.2.1";
-  }
+  return process.env.npm_package_version || "0.2.4";
 }
 function getAnorionDir() {
   const cwd = process.cwd();

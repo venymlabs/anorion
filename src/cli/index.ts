@@ -11,13 +11,7 @@ import pc from 'picocolors';
 // ── Helpers ──────────────────────────────────────────────────────────
 
 function getVersion(): string {
-  try {
-    const pkgPath = resolve(dirname(import.meta.url.replace('file://', '')), '../../package.json');
-    const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
-    return pkg.version || '0.2.2';
-  } catch {
-    return '0.2.2';
-  }
+  return process.env.npm_package_version || '0.2.4';
 }
 
 function getAnorionDir(): string {
