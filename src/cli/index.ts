@@ -11,7 +11,7 @@ import pc from 'picocolors';
 // ── Helpers ──────────────────────────────────────────────────────────
 
 function getVersion(): string {
-  return process.env.npm_package_version || '0.2.4';
+  return process.env.npm_package_version || '0.2.5';
 }
 
 function getAnorionDir(): string {
@@ -25,7 +25,16 @@ function getAnorionDir(): string {
     if (existsSync(resolve(parent, 'anorion.yaml'))) return parent;
     dir = parent;
   }
+  // Check ~/.anorion/ for config
+  const homeDir = process.env.HOME || process.env.USERPROFILE || '/tmp';
+  const anorionHome = resolve(homeDir, '.anorion');
+  if (existsSync(resolve(anorionHome, 'anorion.yaml'))) return anorionHome;
   return cwd;
+}
+
+/** Get the installed package directory (where this CLI lives) */
+function getPackageDir(): string {
+  return resolve(dirname(import.meta.url.replace('file://', '')), '..');
 }
 
 function bold(text: string) { return pc.bold(text); }
@@ -271,27 +280,32 @@ async function cmdInit() {
 async function cmdStart() {
   const detach = args.includes('--detach') || args.includes('-d');
   const anorionDir = getAnorionDir();
+  const packageDir = getPackageDir();
 
-  if (!existsSync(resolve(anorionDir, 'anorion.yaml'))) {
-    error('No anorion.yaml found. Run `anorion init` first.');
-    process.exit(1);
-  }
+  // Determine where to run from: local project or installed package
+  const hasLocalConfig = existsSync(resolve(anorionDir, 'anorion.yaml'));
+  const runDir = hasLocalConfig ? anorionDir : packageDir;
 
   if (detach) {
-    return startDaemon(anorionDir);
+    return startDaemon(runDir);
   }
 
   // Foreground — spawn the gateway
-  console.log(dim(`Starting Anorion gateway from ${anorionDir}...\n`));
+  if (hasLocalConfig) {
+    console.log(dim(`Starting Anorion gateway from ${runDir}...\n`));
+  } else {
+    console.log(dim(`No local anorion.yaml found. Starting from installed package.\n`));
+    console.log(dim(`Run \`anorion init\` to create a local config first.\n`));
+  }
+
   const { spawn } = await import('node:child_process');
-  const isBun = existsSync(resolve(anorionDir, 'node_modules')) &&
-    process.env.BUN_INSTALL || existsSync('/usr/local/bin/bun');
+  const isBun = process.env.BUN_INSTALL || existsSync('/usr/local/bin/bun');
 
   const runtime = isBun ? 'bun' : 'node';
-  const entry = resolve(anorionDir, 'src/index.ts');
+  const entry = resolve(runDir, 'src/index.ts');
 
   const child = spawn(runtime, [entry], {
-    cwd: anorionDir,
+    cwd: runDir,
     stdio: 'inherit',
     env: { ...process.env },
   });
