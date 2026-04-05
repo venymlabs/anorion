@@ -1,12 +1,14 @@
 // Bridge Client — outbound connection to a peer gateway
 
-import {
+import type {
   BridgeMessage,
+  HelloPayload,
+  MessageForwardPayload,
+  MessageResponsePayload,
+} from './protocol';
+import {
   createBridgeMessage,
   parseBridgeMessage,
-  type HelloPayload,
-  type MessageForwardPayload,
-  type MessageResponsePayload,
   BRIDGE_VERSION,
 } from './protocol';
 import { logger } from '../shared/logger';

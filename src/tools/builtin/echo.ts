@@ -1,5 +1,4 @@
-import type { ToolDefinition } from './types';
-import type { ToolContext, ToolResult } from './types';
+import type { ToolDefinition, ToolContext, ToolResult } from '../../shared/types';
 
 const echoTool: ToolDefinition = {
   name: 'echo',
@@ -12,7 +11,7 @@ const echoTool: ToolDefinition = {
     required: ['message'],
   },
   category: 'system',
-  execute: async (params): Promise<ToolResult> => {
+  execute: async (params: Record<string, unknown>): Promise<ToolResult> => {
     return { content: String(params.message ?? '') };
   },
 };

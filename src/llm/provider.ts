@@ -1,6 +1,6 @@
 // LLM Provider — unified interface using multi-provider registry
 
-import { generateText, streamText, type CoreMessage, type Tool as AiTool } from 'ai';
+import { generateText, streamText, type ModelMessage, type Tool as AiTool } from 'ai';
 import { resolveModel, type ResolvedModel } from './providers';
 import { logger } from '../shared/logger';
 import { eventBus } from '../shared/events';
@@ -9,7 +9,7 @@ import { tokenBudget } from '../shared/token-budget';
 
 export interface LlmOptions {
   systemPrompt: string;
-  messages: CoreMessage[];
+  messages: ModelMessage[];
   tools: ToolDefinition[];
   modelId: string;
   fallbackModelId?: string;

@@ -16,10 +16,11 @@ agents:
 
 channels:
   telegram:
-    enabled: false
-    botToken: ${TELEGRAM_BOT_TOKEN:-}
-    allowedUsers: []
-    defaultAgent: example
+    enabled: true
+    botToken: ${TELEGRAM_BOT_TOKEN}
+    allowedUsers:
+      - ${TELEGRAM_ALLOWED_USER_ID}
+    defaultAgent: "001"
 
 scheduler:
   enabled: false

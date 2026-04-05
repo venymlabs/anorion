@@ -29,8 +29,10 @@ class AgentRegistry {
         const raw = readFileSync(resolve(absDir, file), 'utf-8');
         const parsed = parseYaml(raw) as Partial<AgentConfig>;
         if (!parsed.name) continue;
+        // Deterministic ID from agent name for stability across restarts
+        const nameHash = Bun.hash(parsed.name).toString(16).padStart(8, '0').slice(0, 8);
         await this.create({
-          id: parsed.id || crypto.randomUUID().slice(0, 10),
+          id: parsed.id || ('agent-' + nameHash),
           name: parsed.name,
           model: parsed.model || 'openai/gpt-4o',
           systemPrompt: parsed.systemPrompt || 'You are a helpful assistant.',
@@ -108,7 +110,7 @@ class AgentRegistry {
 
     if (this.prepared) {
       this.prepared.agentUpdate.run({
-        $id,
+        $id: id,
         $name: updated.name,
         $model: updated.model,
         $fallbackModel: updated.fallbackModel ?? null,

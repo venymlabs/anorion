@@ -75,9 +75,11 @@ class ChannelRouter {
         channelId: envelope.channelId,
       });
 
-      if (result.content) {
-        await channel.send(envelope, result.content);
+      const reply = result.content || 'I processed your request but had no text response to share.';
+      if (!result.content) {
+        logger.warn({ agent: agentName, sessionId: result.sessionId }, 'Agent returned empty content, sending fallback');
       }
+      await channel.send(envelope, reply);
     } catch (err) {
       const errorMsg = `Error: ${(err as Error).message}`;
       logger.error({ error: errorMsg, agent: agentName }, 'Agent processing failed');

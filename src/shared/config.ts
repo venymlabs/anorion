@@ -50,17 +50,51 @@ const telegramChannelSchema = z.object({
   defaultAgent: z.string().default('example'),
 });
 
+const webhookChannelSchema = z.object({
+  enabled: z.boolean().default(false),
+  inboundSecret: z.string().default(''),
+  outboundUrls: z.array(z.string()).default([]),
+  allowedIps: z.array(z.string()).default([]),
+});
+
 const channelsSchema = z.object({
-  telegram: telegramChannelSchema.default({}),
+  telegram: telegramChannelSchema.default({} as any),
+  webhook: webhookChannelSchema.default({} as any),
+});
+
+const skillsSchema = z.object({
+  dir: z.string().default('./skills'),
+  watch: z.boolean().default(false),
+});
+
+const auditSchema = z.object({
+  enabled: z.boolean().default(true),
+  dbPath: z.string().default('./data/audit.db'),
+});
+
+const tokenBudgetSchema = z.object({
+  enabled: z.boolean().default(false),
+  sessionLimit: z.number().default(500_000),
+  dailyLimit: z.number().default(2_000_000),
+  globalDailyLimit: z.number().default(10_000_000),
+  mode: z.enum(['track', 'enforce']).default('enforce'),
+});
+
+const pipelinesSchema = z.object({
+  dir: z.string().optional(),
 });
 
 const configSchema = z.object({
-  gateway: gatewaySchema.default({}),
-  agents: agentsSchema.default({}),
-  scheduler: schedulerSchema.default({}),
-  bridge: bridgeSchema.default({}),
-  memory: memorySchema.default({}),
-  channels: channelsSchema.default({}),
+  gateway: gatewaySchema.default({} as any),
+  agents: agentsSchema.default({} as any),
+  scheduler: schedulerSchema.default({} as any),
+  bridge: bridgeSchema.default({} as any),
+  memory: memorySchema.default({} as any),
+  channels: channelsSchema.default({} as any),
+  skills: skillsSchema.default({} as any),
+  audit: auditSchema.default({} as any),
+  tokenBudget: tokenBudgetSchema.default({} as any),
+  pipelines: pipelinesSchema.default({} as any),
 });
 
 export type AnorionConfig = z.infer<typeof configSchema>;

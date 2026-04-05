@@ -1,6 +1,6 @@
 import type { ToolDefinition, ToolContext, ToolResult } from '../shared/types';
 import { memoryManager, type MemoryCategory } from '../../memory/store';
-import { logger } from '../shared/logger';
+import { logger } from '../../shared/logger';
 
 const VALID_CATEGORIES: MemoryCategory[] = ['identity', 'preference', 'fact', 'lesson', 'context'];
 

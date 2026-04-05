@@ -131,7 +131,7 @@ class SessionManager {
     if (this.prepared) {
       this.prepared.sessionInsert.run({
         $id: session.id,
-        $agentId,
+        $agentId: agentId,
         $channelId: channelId ?? null,
         $status: 'active',
         $tokensUsed: 0,
@@ -252,6 +252,52 @@ class SessionManager {
     }
 
     return message;
+  }
+
+  /** Get messages in Vercel AI SDK ModelMessage format, properly reconstructing tool calls */
+  async getMessagesAsCore(sessionId: string, limit = 50): Promise<import('ai').ModelMessage[]> {
+    const messages = await this.getMessages(sessionId, limit);
+    const result: import('ai').ModelMessage[] = [];
+
+    for (const msg of messages) {
+      if (msg.role === 'user' || msg.role === 'system') {
+        result.push({ role: msg.role, content: msg.content });
+      } else if (msg.role === 'assistant') {
+        if (msg.toolCalls && msg.toolCalls.length > 0) {
+          // Assistant with tool calls — use content parts format
+          const parts: any[] = [];
+          if (msg.content) {
+            parts.push({ type: 'text', text: msg.content });
+          }
+          for (const tc of msg.toolCalls) {
+            parts.push({
+              type: 'tool-call',
+              toolCallId: tc.id,
+              toolName: tc.name,
+              args: JSON.parse(tc.arguments || '{}'),
+            });
+          }
+          result.push({ role: 'assistant', content: parts });
+        } else {
+          result.push({ role: 'assistant', content: msg.content });
+        }
+      } else if (msg.role === 'tool') {
+        if (msg.toolResults && msg.toolResults.length > 0) {
+          const parts: any[] = msg.toolResults.map((tr) => ({
+            type: 'tool-result' as const,
+            toolCallId: tr.toolCallId,
+            toolName: tr.toolName,
+            output: tr.error ? `Error: ${tr.error}` : tr.content,
+          }));
+          result.push({ role: 'tool' as const, content: parts } as any);
+        } else {
+          // Fallback: plain text tool result
+          result.push({ role: 'tool' as const, content: [{ type: 'tool-result' as const, toolCallId: 'unknown', toolName: 'unknown', output: msg.content }] } as any);
+        }
+      }
+    }
+
+    return result;
   }
 
   async getMessages(sessionId: string, limit = 50): Promise<Message[]> {

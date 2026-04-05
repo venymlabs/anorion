@@ -32,7 +32,7 @@ export class PreparedStatements {
     this.agentInsert = db.prepare(
       `INSERT INTO agents (id, name, model, fallback_model, system_prompt, tools, max_iterations, timeout_ms, state, tags, metadata, created_at, updated_at)
        VALUES ($id, $name, $model, $fallbackModel, $systemPrompt, $tools, $maxIterations, $timeoutMs, $state, $tags, $metadata, $createdAt, $updatedAt)
-       ON CONFLICT (id) DO UPDATE SET updated_at = $updatedAt`,
+       ON CONFLICT (name) DO UPDATE SET id=$id, model=$model, fallback_model=$fallbackModel, system_prompt=$systemPrompt, tools=$tools, max_iterations=$maxIterations, timeout_ms=$timeoutMs, state=$state, tags=$tags, metadata=$metadata, updated_at=$updatedAt`,
     );
 
     this.agentUpdate = db.prepare(
