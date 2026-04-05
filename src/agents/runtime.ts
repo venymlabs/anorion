@@ -1,7 +1,20 @@
-import { generateText, type ModelMessage, type Tool as AiTool } from 'ai';
-import type { Agent, ToolCall, ToolResultEntry } from '../shared/types';
+import {
+  generateText,
+  streamText,
+  type ModelMessage,
+  type Tool as AiTool,
+} from 'ai';
+import type {
+  Agent,
+  ToolCall,
+  ToolResultEntry,
+  StreamChunk,
+  OnChunkCallback,
+  CategorizedError,
+  AgentRunMetrics,
+} from '../shared/types';
 import { toolRegistry } from '../tools/registry';
-import { executeTool } from '../tools/executor';
+import { executeTool, executeToolsParallel, type ParallelToolCall } from '../tools/executor';
 import { sessionManager } from './session';
 import { agentRegistry } from './registry';
 import { shouldCompact, compactMessages } from '../memory/context';
@@ -9,7 +22,9 @@ import { logger } from '../shared/logger';
 import { memoryManager } from '../memory/store';
 import { eventBus } from '../shared/events';
 import { resolveModel } from '../llm/providers';
-import { stepCountIs } from 'ai';
+import { jsonSchema } from '@ai-sdk/provider-utils';
+
+// ── Interfaces ──
 
 export interface SendMessageInput {
   agentId: string;
@@ -17,6 +32,9 @@ export interface SendMessageInput {
   text: string;
   channelId?: string;
   stream?: boolean;
+  abortSignal?: AbortSignal;
+  onChunk?: OnChunkCallback;
+  maxIterations?: number;
 }
 
 export interface SendMessageResult {
@@ -26,25 +44,102 @@ export interface SendMessageResult {
   toolResults: ToolResultEntry[];
   usage?: { promptTokens: number; completionTokens: number; totalTokens: number };
   durationMs: number;
+  iterations: number;
+  metrics?: AgentRunMetrics;
 }
 
-/**
- * Convert ToolDefinition[] to AI SDK Tool format with execute functions.
- */
+// ── Error categorization ──
+
+function categorizeError(err: Error): CategorizedError {
+  const msg = err.message.toLowerCase();
+  const statusMatch = msg.match(/status[_ ]?(\d{3})/);
+  const status = statusMatch?.[1] ? parseInt(statusMatch[1]) : 0;
+
+  if (status === 429 || msg.includes('rate limit') || msg.includes('too many requests')) {
+    const retryAfter = msg.match(/retry[_-]?after[:\s]+(\d+)/);
+    return {
+      category: 'rate_limit',
+      message: err.message,
+      retryable: true,
+      retryAfterMs: retryAfter?.[1] ? parseInt(retryAfter[1]) * 1000 : 2000,
+      originalError: err,
+    };
+  }
+
+  if (status === 401 || status === 403 || msg.includes('auth') || msg.includes('api key') || msg.includes('forbidden')) {
+    return { category: 'authentication', message: err.message, retryable: false, originalError: err };
+  }
+
+  if (err.name === 'AbortError' || msg.includes('timeout') || msg.includes('timed out') || msg.includes('etimedout')) {
+    return { category: 'timeout', message: err.message, retryable: true, retryAfterMs: 1000, originalError: err };
+  }
+
+  if (status === 400 && (msg.includes('context') || msg.includes('token') || msg.includes('max'))) {
+    return { category: 'context_length', message: err.message, retryable: false, originalError: err };
+  }
+
+  if (status >= 500 || msg.includes('overloaded') || msg.includes('server error')) {
+    return { category: 'model_error', message: err.message, retryable: true, retryAfterMs: 3000, originalError: err };
+  }
+
+  return { category: 'unknown', message: err.message, retryable: false, originalError: err };
+}
+
+// ── Retry with error-aware backoff ──
+
+async function retryWithBackoff<T>(
+  fn: () => Promise<T>,
+  maxRetries: number = 3,
+): Promise<T> {
+  let lastErr: CategorizedError | null = null;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = categorizeError(err as Error);
+
+      if (!lastErr.retryable || attempt >= maxRetries) {
+        throw lastErr.originalError;
+      }
+
+      const delay = lastErr.retryAfterMs
+        ? lastErr.retryAfterMs * Math.pow(2, attempt)
+        : 1000 * Math.pow(2, attempt);
+
+      const jitter = Math.random() * 500;
+      const waitMs = Math.min(delay + jitter, 30_000);
+
+      logger.warn(
+        { category: lastErr.category, attempt: attempt + 1, waitMs: Math.round(waitMs), error: lastErr.message },
+        'LLM call failed, retrying',
+      );
+
+      await new Promise((r) => setTimeout(r, waitMs));
+    }
+  }
+
+  throw lastErr!.originalError;
+}
+
+// ── Build AI SDK tools (v6 compatible) ──
+
 function buildAiTools(
   agentId: string,
   sessionId: string,
+  signal?: AbortSignal,
 ): Record<string, AiTool> {
   const tools = toolRegistry.listForAgent(agentId);
   const aiTools: Record<string, AiTool> = {};
 
-  for (const tool of tools) {
-    aiTools[tool.name] = {
-      description: tool.description,
-      parameters: tool.parameters as Record<string, unknown>,
-      execute: async (args: Record<string, unknown>) => {
+  for (const t of tools) {
+    aiTools[t.name] = {
+      description: t.description,
+      inputSchema: jsonSchema(t.parameters as any),
+      execute: async (args: Record<string, unknown>, { }: { toolCallId: string }) => {
+        if (signal?.aborted) return { error: 'Aborted' };
         try {
-          const result = await executeTool(tool, args, { agentId, sessionId });
+          const result = await executeTool(t, args, { agentId, sessionId, signal });
           if (result.error) {
             return { error: result.error, content: result.content };
           }
@@ -53,37 +148,66 @@ function buildAiTools(
           return { error: (err as Error).message };
         }
       },
-    };
+    } as AiTool;
   }
 
   return aiTools;
 }
 
+// ── Helper to extract tool call info from v6 TypedToolCall ──
+
+function extractToolCallInfo(tc: { toolCallId: string; toolName: string; input: unknown }): ToolCall {
+  return {
+    id: tc.toolCallId,
+    name: tc.toolName,
+    arguments: JSON.stringify(tc.input),
+  };
+}
+
+function extractUsage(usage: { inputTokens: number | undefined; outputTokens: number | undefined } | undefined): { promptTokens: number; completionTokens: number; totalTokens: number } {
+  const p = usage?.inputTokens ?? 0;
+  const c = usage?.outputTokens ?? 0;
+  return { promptTokens: p, completionTokens: c, totalTokens: p + c };
+}
+
+// ── Main sendMessage with proper agentic loop ──
+
 export async function sendMessage(input: SendMessageInput): Promise<SendMessageResult> {
   const agent = agentRegistry.get(input.agentId) || agentRegistry.getByName(input.agentId);
   if (!agent) throw new Error(`Agent not found: ${input.agentId}`);
+  const agentId = agent.id;
 
-  agentRegistry.setState(agent.id, 'processing');
+  agentRegistry.setState(agentId, 'processing');
+
+  const abortController = new AbortController();
+  const signal = input.abortSignal ?? abortController.signal;
+
+  // Link external abort signal
+  if (input.abortSignal) {
+    input.abortSignal.addEventListener('abort', () => abortController.abort(), { once: true });
+  }
 
   try {
     // Get or create session
-    let sessionId = input.sessionId;
+    let sessionId = input.sessionId ?? '';
     if (!sessionId) {
-      const session = await sessionManager.create(agent.id, input.channelId);
+      const session = await sessionManager.create(agentId, input.channelId);
       sessionId = session.id;
     }
 
-    eventBus.emit('agent:processing', { agentId: agent.id, sessionId, timestamp: Date.now() });
+    eventBus.emit('agent:processing', { agentId, sessionId, timestamp: Date.now() });
 
     // Store user message
     await sessionManager.addMessage({
       sessionId,
-      agentId: agent.id,
+      agentId,
       role: 'user',
       content: input.text,
+      priority: 'high',
     });
 
     const startTime = Date.now();
+    const onChunk = input.onChunk;
 
     // Build context from history
     const history = await sessionManager.getMessagesAsCore(sessionId, 50);
@@ -104,100 +228,164 @@ export async function sendMessage(input: SendMessageInput): Promise<SendMessageR
       ? `${agent.systemPrompt}\n\n${memoryContext}`
       : agent.systemPrompt;
 
-    const maxIter = agent.maxIterations || 10;
-    const aiTools = buildAiTools(agent.id, sessionId);
-    const hasTools = Object.keys(aiTools).length > 0;
-
-    // Track tool calls/results for the result object
-    const allToolCalls: ToolCall[] = [];
-    const allToolResults: ToolResultEntry[] = [];
-
+    const maxIter = input.maxIterations || agent.maxIterations || 10;
     const resolved = resolveModel(agent.model);
 
-    let result;
+    // Track metrics
+    const allToolCalls: ToolCall[] = [];
+    const allToolResults: ToolResultEntry[] = [];
+    let totalPromptTokens = 0;
+    let totalCompletionTokens = 0;
+    let iterations = 0;
+    let finalContent = '';
+
+    // ── Agentic loop ──
+    // We use a simple approach: call generateText with stopWhen: stepCountIs(maxIter)
+    // but with our own onStepFinish for parallel tool execution tracking.
+    // AI SDK v6 handles the multi-turn loop internally with stepCountIs.
+
+    const aiTools = buildAiTools(agent.id, sessionId, signal);
+    const hasTools = Object.keys(aiTools).length > 0;
+
     try {
-      result = await generateText({
-        model: resolved.instance,
-        system: systemPrompt,
-        messages: contextMessages,
-        tools: hasTools ? aiTools : undefined,
-        stopWhen: hasTools ? stepCountIs(maxIter) : stepCountIs(1),
-        maxTokens: 4096,
-        temperature: 0.7,
-        onStepFinish: (step) => {
-          // Track tool calls and results from each step
-          for (const tc of step.toolCalls) {
-            allToolCalls.push({
-              id: tc.toolCallId,
-              name: tc.toolName,
-              arguments: JSON.stringify(tc.args),
-            });
-            eventBus.emit('agent:tool-call', {
-              agentId: agent.id,
-              sessionId,
-              toolName: tc.toolName,
-              toolCallId: tc.toolCallId,
-              timestamp: Date.now(),
-            });
-          }
-          for (const tr of step.toolResults) {
-            allToolResults.push({
-              toolCallId: tr.toolCallId,
-              toolName: tr.toolName,
-              content: typeof tr.result === 'string' ? tr.result : JSON.stringify(tr.result),
-            });
-          }
-        },
-      });
+      const agentId = agent.id;
+      const agentName = agent.name;
+      const result = await retryWithBackoff(() =>
+        generateText({
+          model: resolved.instance,
+          system: systemPrompt,
+          messages: contextMessages,
+          tools: hasTools ? aiTools : undefined,
+          stopWhen: hasTools ? stepCountIs(maxIter) : stepCountIs(1),
+          maxOutputTokens: 4096,
+          temperature: 0.7,
+          abortSignal: signal,
+          onStepFinish: (step) => {
+            // Track tool calls and results
+            for (const tc of step.toolCalls as any[]) {
+              const call = extractToolCallInfo(tc);
+              allToolCalls.push(call);
+              eventBus.emit('agent:tool-call', {
+                agentId: agent.id,
+                sessionId,
+                toolName: tc.toolName,
+                toolCallId: tc.toolCallId,
+                timestamp: Date.now(),
+              });
+              if (onChunk) {
+                onChunk({ type: 'tool_call', toolCall: call });
+              }
+            }
+            for (const tr of step.toolResults as any[]) {
+              const entry: ToolResultEntry = {
+                toolCallId: tr.toolCallId,
+                toolName: tr.toolName,
+                content: typeof tr.result === 'string' ? tr.result : JSON.stringify(tr.result),
+              };
+              allToolResults.push(entry);
+              if (onChunk) {
+                onChunk({ type: 'tool_result', toolResult: entry });
+              }
+            }
+            // Accumulate usage per step
+            if (step.usage) {
+              const u = extractUsage(step.usage);
+              totalPromptTokens += u.promptTokens;
+              totalCompletionTokens += u.completionTokens;
+            }
+            // Stream text from each step
+            if (step.text && onChunk) {
+              onChunk({ type: 'delta', content: step.text });
+            }
+          },
+        }),
+      );
+
+      // Final usage from result
+      if (result.usage) {
+        const u = extractUsage(result.usage as any);
+        // Use the final result usage as the most accurate
+        totalPromptTokens = u.promptTokens || totalPromptTokens;
+        totalCompletionTokens = u.completionTokens || totalCompletionTokens;
+      }
+
+      finalContent = result.text || '';
+      iterations = allToolCalls.length > 0 ? maxIter : 1; // approximate
+
+      // Stream final text
+      if (finalContent && onChunk) {
+        // Already streamed via onStepFinish, but ensure final is captured
+      }
+
     } catch (err) {
-      // If primary model fails, try fallback
-      const fallback = agent.fallbackModel;
-      if (!fallback) throw err;
+      const cat = categorizeError(err as Error);
 
-      logger.warn({ model: agent.model, error: (err as Error).message }, 'Primary model failed, trying fallback');
-      const fallbackResolved = resolveModel(fallback);
+      // If context_length error, try compacting and retrying once
+      if (cat.category === 'context_length') {
+        logger.info({ sessionId }, 'Context length exceeded, forcing compaction');
+        const { messages: compacted } = compactMessages(history as any[], {
+          thresholdPercent: 0.5,
+          keepLastMessages: 10,
+        });
+        contextMessages = compacted as ModelMessage[];
 
-      result = await generateText({
-        model: fallbackResolved.instance,
-        system: systemPrompt,
-        messages: contextMessages,
-        tools: hasTools ? aiTools : undefined,
-        stopWhen: hasTools ? stepCountIs(maxIter) : stepCountIs(1),
-        maxTokens: 4096,
-        temperature: 0.7,
-        onStepFinish: (step) => {
-          for (const tc of step.toolCalls) {
-            allToolCalls.push({
-              id: tc.toolCallId,
-              name: tc.toolName,
-              arguments: JSON.stringify(tc.args),
-            });
-          }
-          for (const tr of step.toolResults) {
-            allToolResults.push({
-              toolCallId: tr.toolCallId,
-              toolName: tr.toolName,
-              content: typeof tr.result === 'string' ? tr.result : JSON.stringify(tr.result),
-            });
-          }
-        },
-      });
+        const retryResult = await generateText({
+          model: resolved.instance,
+          system: systemPrompt,
+          messages: contextMessages,
+          tools: hasTools ? aiTools : undefined,
+          stopWhen: hasTools ? stepCountIs(maxIter) : stepCountIs(1),
+          maxOutputTokens: 4096,
+          temperature: 0.7,
+          abortSignal: signal,
+        });
+        finalContent = retryResult.text || '';
+        if (retryResult.usage) {
+          const u = extractUsage(retryResult.usage as any);
+          totalPromptTokens = u.promptTokens;
+          totalCompletionTokens = u.completionTokens;
+        }
+      } else if (agent.fallbackModel && (cat.category === 'model_error' || cat.category === 'rate_limit')) {
+        // Try fallback model
+        logger.warn({ fallback: agent.fallbackModel }, 'Trying fallback model');
+        const fallbackResolved = resolveModel(agent.fallbackModel);
+        const fbResult = await retryWithBackoff(() =>
+          generateText({
+            model: fallbackResolved.instance,
+            system: systemPrompt,
+            messages: contextMessages,
+            tools: hasTools ? aiTools : undefined,
+            stopWhen: hasTools ? stepCountIs(maxIter) : stepCountIs(1),
+            maxOutputTokens: 4096,
+            temperature: 0.7,
+            abortSignal: signal,
+          }),
+        );
+        finalContent = fbResult.text || '';
+        if (fbResult.usage) {
+          const u = extractUsage(fbResult.usage as any);
+          totalPromptTokens = u.promptTokens;
+          totalCompletionTokens = u.completionTokens;
+        }
+      } else {
+        throw err;
+      }
     }
 
     const durationMs = Date.now() - startTime;
-    const text = result.text || '';
 
-    // Determine final content — if empty after tool usage, try a summary call
-    let finalContent = text;
+    // If empty after all iterations with tool calls, generate summary
     if (!finalContent && allToolCalls.length > 0) {
       logger.warn({ sessionId }, 'Empty response after tool usage, requesting summary');
       try {
         const summaryResult = await generateText({
           model: resolved.instance,
           system: systemPrompt,
-          messages: contextMessages,
-          prompt: 'Please summarize the results of the tool calls that were just executed.',
-          maxTokens: 1024,
+          messages: [
+            ...contextMessages,
+            { role: 'user' as const, content: 'Please summarize the results of the tool calls that were just executed.' },
+          ],
+          maxOutputTokens: 1024,
           temperature: 0.5,
         });
         finalContent = summaryResult.text || 'I completed the requested actions but could not generate a summary.';
@@ -208,25 +396,31 @@ export async function sendMessage(input: SendMessageInput): Promise<SendMessageR
       finalContent = 'I processed your request but had no text response to share.';
     }
 
-    const usage = result.usage
-      ? {
-          promptTokens: result.usage.promptTokens,
-          completionTokens: result.usage.completionTokens,
-          totalTokens: result.usage.promptTokens + result.usage.completionTokens,
-        }
-      : undefined;
+    const usage = {
+      promptTokens: totalPromptTokens,
+      completionTokens: totalCompletionTokens,
+      totalTokens: totalPromptTokens + totalCompletionTokens,
+    };
 
-    // Emit token usage
-    if (usage) {
-      eventBus.emit('token:usage', {
-        agentId: agent.id,
-        sessionId,
-        model: agent.model,
-        promptTokens: usage.promptTokens,
-        completionTokens: usage.completionTokens,
-        timestamp: Date.now(),
-      });
-    }
+    const metrics: AgentRunMetrics = {
+      agentId: agent.id,
+      sessionId,
+      model: agent.model,
+      durationMs,
+      iterations,
+      toolCallCount: allToolCalls.length,
+      ...usage,
+    };
+
+    // Emit token usage and metrics
+    eventBus.emit('token:usage', {
+      agentId: agent.id,
+      sessionId,
+      model: agent.model,
+      promptTokens: totalPromptTokens,
+      completionTokens: totalCompletionTokens,
+      timestamp: Date.now(),
+    });
 
     // Store assistant response
     await sessionManager.addMessage({
@@ -237,8 +431,8 @@ export async function sendMessage(input: SendMessageInput): Promise<SendMessageR
       toolCalls: allToolCalls.length > 0 ? allToolCalls : undefined,
       toolResults: allToolResults.length > 0 ? allToolResults : undefined,
       model: agent.model,
-      tokensIn: usage?.promptTokens,
-      tokensOut: usage?.completionTokens,
+      tokensIn: usage.promptTokens,
+      tokensOut: usage.completionTokens,
       durationMs,
     });
 
@@ -247,9 +441,18 @@ export async function sendMessage(input: SendMessageInput): Promise<SendMessageR
       sessionId,
       content: finalContent,
       durationMs,
-      tokensUsed: usage?.totalTokens,
+      tokensUsed: usage.totalTokens,
       timestamp: Date.now(),
     });
+
+    logger.info(
+      { agentId: agent.id, sessionId, iterations, toolCalls: allToolCalls.length, tokens: usage.totalTokens, durationMs },
+      'Agent turn completed',
+    );
+
+    if (onChunk) {
+      onChunk({ type: 'done', usage });
+    }
 
     return {
       sessionId,
@@ -258,11 +461,23 @@ export async function sendMessage(input: SendMessageInput): Promise<SendMessageR
       toolResults: allToolResults,
       usage,
       durationMs,
+      iterations,
+      metrics,
     };
   } catch (err) {
-    logger.error({ agentId: agent.id, error: (err as Error).message }, 'Agent runtime error');
+    const cat = categorizeError(err as Error);
+    logger.error(
+      { agentId: agent.id, category: cat.category, error: (err as Error).message },
+      'Agent runtime error',
+    );
     agentRegistry.setState(agent.id, 'error');
-    eventBus.emit('agent:error', { agentId: agent.id, sessionId: input.sessionId || '', error: (err as Error).message, timestamp: Date.now() });
+    eventBus.emit('agent:error', {
+      agentId: agent.id,
+      sessionId: input.sessionId || '',
+      error: (err as Error).message,
+      category: cat.category,
+      timestamp: Date.now(),
+    });
     throw err;
   } finally {
     agentRegistry.setState(agent.id, 'idle');
@@ -270,8 +485,13 @@ export async function sendMessage(input: SendMessageInput): Promise<SendMessageR
   }
 }
 
+// ── Import stepCountIs ──
+import { stepCountIs } from 'ai';
+
+// ── Streaming variant ──
+
 export async function* streamMessage(input: SendMessageInput) {
-  const agent = agentRegistry.get(input.agentId);
+  const agent = agentRegistry.get(input.agentId) || agentRegistry.getByName(input.agentId);
   if (!agent) throw new Error(`Agent not found: ${input.agentId}`);
 
   let sessionId = input.sessionId;
@@ -285,29 +505,81 @@ export async function* streamMessage(input: SendMessageInput) {
     agentId: agent.id,
     role: 'user',
     content: input.text,
+    priority: 'high',
   });
 
   const history = await sessionManager.getMessagesAsCore(sessionId, 50);
-  const { streamLlm } = await import('../llm/provider');
+  let contextMessages = history;
+  if (shouldCompact(history as any[])) {
+    const { messages: compacted } = compactMessages(history as any[]);
+    contextMessages = compacted as ModelMessage[];
+  }
 
+  const resolved = resolveModel(agent.model);
   const agentTools = toolRegistry.listForAgent(agent.id);
   const memoryContext = memoryManager.buildContext(agent.id);
+  const systemPrompt = memoryContext
+    ? `${agent.systemPrompt}\n\n${memoryContext}`
+    : agent.systemPrompt;
 
-  const stream = streamLlm({
-    systemPrompt: memoryContext
-      ? `${agent.systemPrompt}\n\n${memoryContext}`
-      : agent.systemPrompt,
-    messages: history,
-    tools: agentTools,
-    modelId: agent.model,
-    maxTokens: 4096,
+  const aiTools: Record<string, AiTool> = {};
+  for (const t of agentTools) {
+    aiTools[t.name] = {
+      description: t.description,
+      inputSchema: jsonSchema(t.parameters as any),
+      execute: async (args: Record<string, unknown>) => {
+        const result = await executeTool(t, args, { agentId: agent.id, sessionId, signal: input.abortSignal });
+        if (result.error) return { error: result.error, content: result.content };
+        return result.content;
+      },
+    } as AiTool;
+  }
+
+  const stream = streamText({
+    model: resolved.instance,
+    system: systemPrompt,
+    messages: contextMessages,
+    tools: Object.keys(aiTools).length > 0 ? aiTools : undefined,
+    maxOutputTokens: 4096,
+    abortSignal: input.abortSignal,
   });
 
   let fullContent = '';
-  for await (const chunk of stream) {
-    yield { sessionId, chunk };
-    if (chunk.type === 'delta') {
-      fullContent += chunk.content;
+  for await (const chunk of stream.fullStream) {
+    if (chunk.type === 'text-delta') {
+      const text = (chunk as any).delta ?? (chunk as any).text ?? '';
+      fullContent += text;
+      yield { sessionId, chunk: { type: 'delta', content: text } };
+      if (input.onChunk) input.onChunk({ type: 'delta', content: text });
+    } else if (chunk.type === 'tool-call') {
+      yield {
+        sessionId,
+        chunk: {
+          type: 'tool_call',
+          toolCall: { id: chunk.toolCallId, name: chunk.toolName, arguments: JSON.stringify((chunk as any).input ?? (chunk as any).args) },
+        },
+      };
+    } else if (chunk.type === 'tool-result') {
+      yield {
+        sessionId,
+        chunk: {
+          type: 'tool_result',
+          toolResult: { toolCallId: (chunk as any).toolCallId, toolName: (chunk as any).toolName, content: String((chunk as any).result) },
+        },
+      };
+    } else if (chunk.type === 'finish') {
+      const totalUsage = (chunk as any).totalUsage;
+      if (totalUsage) {
+        eventBus.emit('token:usage', {
+          agentId: agent.id,
+          sessionId,
+          model: agent.model,
+          promptTokens: totalUsage.inputTokens ?? 0,
+          completionTokens: totalUsage.outputTokens ?? 0,
+          timestamp: Date.now(),
+        });
+      }
+      yield { sessionId, chunk: { type: 'done' } };
     }
   }
 

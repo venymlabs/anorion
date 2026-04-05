@@ -34,7 +34,10 @@ export interface Message {
   model?: string;
   durationMs?: number;
   createdAt: string;
+  priority?: MessagePriority;
 }
+
+export type MessagePriority = 'critical' | 'high' | 'normal' | 'low';
 
 export interface MessageEnvelope {
   id: string;
@@ -67,6 +70,8 @@ export interface ToolDefinition {
   category?: string;
   timeoutMs?: number;
   maxOutputBytes?: number;
+  cacheable?: boolean;
+  cacheTtlMs?: number;
 }
 
 export interface ToolContext {
@@ -107,4 +112,55 @@ export interface LlmResponse {
   content: string;
   toolCalls?: ToolCall[];
   usage?: { promptTokens: number; completionTokens: number; totalTokens: number };
+  thinkingContent?: string;
+}
+
+// ── Streaming types ──
+
+export interface StreamChunk {
+  type: 'delta' | 'thinking' | 'tool_call' | 'tool_result' | 'done' | 'error';
+  content?: string;
+  toolCall?: ToolCall;
+  toolResult?: ToolResultEntry;
+  usage?: { promptTokens: number; completionTokens: number; totalTokens: number };
+  error?: string;
+}
+
+export type OnChunkCallback = (chunk: StreamChunk) => void;
+
+// ── Error categorization ──
+
+export type ErrorCategory = 'rate_limit' | 'authentication' | 'timeout' | 'model_error' | 'context_length' | 'unknown';
+
+export interface CategorizedError {
+  category: ErrorCategory;
+  message: string;
+  retryable: boolean;
+  retryAfterMs?: number;
+  originalError: Error;
+}
+
+// ── Token tracking ──
+
+export interface TokenUsageRecord {
+  agentId: string;
+  sessionId: string;
+  model: string;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  timestamp: number;
+}
+
+export interface AgentRunMetrics {
+  agentId: string;
+  sessionId: string;
+  model: string;
+  durationMs: number;
+  iterations: number;
+  toolCallCount: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  error?: string;
 }
