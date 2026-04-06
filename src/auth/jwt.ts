@@ -29,7 +29,7 @@ function textToBytes(text: string): Uint8Array {
 async function getKey(secret: string): Promise<CryptoKey> {
   return crypto.subtle.importKey(
     'raw',
-    textToBytes(secret),
+    textToBytes(secret) as BufferSource,
     { name: 'HMAC', hash: 'SHA-256' },
     false,
     ['sign', 'verify'],
@@ -63,7 +63,7 @@ export async function signJwt(payload: Omit<JwtPayload, 'iat' | 'exp' | 'iss'>, 
   const signingInput = `${header}.${payloadB64}`;
 
   const key = await getKey(getJwtSecret());
-  const sig = await crypto.subtle.sign('HMAC', key, textToBytes(signingInput));
+  const sig = await crypto.subtle.sign('HMAC', key, textToBytes(signingInput) as BufferSource);
 
   return `${signingInput}.${b64url(sig)}`;
 }
@@ -79,7 +79,7 @@ export async function verifyJwt(token: string): Promise<JwtPayload | null> {
 
   try {
     const key = await getKey(getJwtSecret());
-    const valid = await crypto.subtle.verify('HMAC', key, b64urlDecode(sigB64), textToBytes(signingInput));
+    const valid = await crypto.subtle.verify('HMAC', key, b64urlDecode(sigB64) as BufferSource, textToBytes(signingInput) as BufferSource);
     if (!valid) return null;
 
     const payload = JSON.parse(new TextDecoder().decode(b64urlDecode(payloadB64))) as JwtPayload & { iss?: string };

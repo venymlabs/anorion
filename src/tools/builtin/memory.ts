@@ -1,4 +1,4 @@
-import type { ToolDefinition, ToolContext, ToolResult } from '../shared/types';
+import type { ToolDefinition, ToolContext, ToolResult } from '../../shared/types';
 import { memoryManager, type MemoryCategory } from '../../memory/store';
 import { logger } from '../../shared/logger';
 

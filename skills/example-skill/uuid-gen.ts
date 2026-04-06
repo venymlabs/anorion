@@ -1,4 +1,4 @@
-import type { ToolDefinition, ToolResult } from '../../shared/types';
+import type { ToolDefinition, ToolResult } from '../../src/shared/types';
 
 const uuidGenTool: ToolDefinition = {
   name: 'uuid-gen',
@@ -11,7 +11,7 @@ const uuidGenTool: ToolDefinition = {
   },
   category: 'utility',
   timeoutMs: 1000,
-  execute: async (params): Promise<ToolResult> => {
+  execute: async (params: Record<string, unknown>): Promise<ToolResult> => {
     const count = Math.min(Number(params.count) || 1, 100);
     const uuids = Array.from({ length: count }, () => crypto.randomUUID());
     return { content: uuids.join('\n') };

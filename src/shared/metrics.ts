@@ -155,21 +155,21 @@ export const metrics = new MetricsCollector();
 // Auto-instrument: listen to events and record metrics
 import { eventBus } from '../shared/events';
 
-eventBus.on('agent:response', (data) => {
+eventBus.on('agent:response', (data: any) => {
   metrics.inc('anorion_agent_messages_total', 1, { agent_id: data.agentId });
   metrics.observe('anorion_agent_response_duration_seconds', data.durationMs / 1000, { agent_id: data.agentId });
 });
 
-eventBus.on('agent:error', (data) => {
+eventBus.on('agent:error', (data: any) => {
   metrics.inc('anorion_agent_errors_total', 1, { agent_id: data.agentId });
 });
 
-eventBus.on('tool:executed', (data) => {
+eventBus.on('tool:executed', (data: any) => {
   metrics.inc('anorion_tool_executions_total', 1, { tool_name: data.toolName, success: String(data.success) });
   metrics.observe('anorion_tool_duration_seconds', data.durationMs / 1000, { tool_name: data.toolName });
 });
 
-eventBus.on('token:usage', (data) => {
+eventBus.on('token:usage', (data: any) => {
   metrics.inc('anorion_tokens_total', data.promptTokens + data.completionTokens, { agent_id: data.agentId, model: data.model });
 });
 
@@ -185,6 +185,6 @@ eventBus.on('bridge:message:forwarded', () => {
   metrics.inc('anorion_bridge_messages_forwarded_total');
 });
 
-eventBus.on('schedule:executed', (data) => {
+eventBus.on('schedule:executed', (data: any) => {
   metrics.inc('anorion_schedule_executions_total', 1, { success: String(data.success) });
 });

@@ -42,6 +42,7 @@ class AgentRegistry {
           tags: parsed.tags,
           metadata: parsed.metadata,
           handoffs: parsed.handoffs,
+          collaboration: parsed.collaboration,
         });
       } catch (err) {
         logger.error({ file, error: (err as Error).message }, 'Failed to load agent YAML');

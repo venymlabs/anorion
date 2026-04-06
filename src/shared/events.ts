@@ -74,6 +74,20 @@ export interface AgentEvents {
   'memory:forgotten': { agentId: string; key: string; timestamp: number };
   'schedule:executed': { scheduleId: string; agentId: string; success: boolean; timestamp: number };
   'token:usage': { agentId: string; sessionId: string; model: string; promptTokens: number; completionTokens: number; timestamp: number };
+  'collaboration:started': { sessionId: string; pattern: string; agents: string[]; timestamp: number };
+  'collaboration:completed': { sessionId: string; pattern: string; durationMs: number; tokens: number; contributions: number; agreement?: number; timestamp: number };
+  'collaboration:failed': { sessionId: string; pattern: string; error: string; timestamp: number };
+  'collaboration:cancelled': { sessionId: string; pattern: string; timestamp: number };
+  'stream:delta': { agentId: string; sessionId: string; content: string; accumulated: string; timestamp: number };
+  'stream:done': { agentId: string; sessionId: string; timestamp: number };
+  'stream:error': { agentId: string; sessionId: string; error: string; timestamp: number };
+  // Voice events
+  'voice:turn:transcribed': { sessionId: string; agentId: string; transcription: string; language: string; confidence: number; timestamp: number };
+  'voice:turn:agent-response': { sessionId: string; agentId: string; responseText: string; durationMs: number; timestamp: number };
+  'voice:turn:tts': { sessionId: string; agentId: string; audioBytes: number; durationMs: number; timestamp: number };
+  'voice:conversation:started': { sessionId: string; agentId: string; channelId: string; timestamp: number };
+  'voice:conversation:ended': { sessionId: string; agentId: string; turns: number; durationMs: number; timestamp: number };
+  'voice:conversation:error': { sessionId: string; agentId: string; error: string; timestamp: number };
 }
 
 export type EventName = keyof AgentEvents;

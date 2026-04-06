@@ -127,7 +127,7 @@ export class Federator {
     }
 
     return new Promise((resolve, reject) => {
-      this.messageQueue.push({ targetAgentId, payload: { targetAgentId, text, sessionId, channelId }, resolve, reject });
+      this.messageQueue.push({ targetAgentId, payload: { targetAgentId, messageId: crypto.randomUUID(), text, sessionId, channelId }, resolve: resolve as (v: unknown) => void, reject });
       // Auto-reject after 30s
       setTimeout(() => {
         const idx = this.messageQueue.findIndex((m) => m.resolve === resolve);

@@ -7,6 +7,10 @@ import type {
 import type { MessageEnvelope } from '../shared/types';
 import { logger } from '../shared/logger';
 import { nanoid } from 'nanoid';
+import { sttService } from '../voice/stt';
+import { ttsService } from '../voice/tts';
+import { convertAudio } from '../voice/audio';
+import type { AudioFormat } from '../voice/types';
 
 interface TelegramConfig {
   botToken: string;
@@ -230,7 +234,7 @@ export class TelegramChannel implements ChannelAdapter {
       });
     });
 
-    // Handle voice
+    // Handle voice — auto-transcribe with STT
     this.bot.on('message:voice', async (ctx) => {
       if (!this.isAllowed(ctx)) return;
       const voice = ctx.message?.voice;
@@ -242,11 +246,34 @@ export class TelegramChannel implements ChannelAdapter {
         }
       } catch { /* ignore */ }
 
-      this.dispatchMessage(ctx, '[voice message]', {
+      // Try to transcribe the voice message
+      let transcription = '[voice message]';
+      if (fileUrl) {
+        try {
+          const audioResponse = await fetch(fileUrl);
+          if (audioResponse.ok) {
+            const audioBuffer = Buffer.from(await audioResponse.arrayBuffer());
+            const result = await sttService.transcribe({
+              buffer: audioBuffer,
+              format: 'ogg',
+              durationMs: voice?.duration ? voice.duration * 1000 : undefined,
+            });
+            if (result.text.trim()) {
+              transcription = result.text;
+              logger.info({ text: transcription, language: result.language }, 'Voice message transcribed');
+            }
+          }
+        } catch (err) {
+          logger.warn({ error: (err as Error).message }, 'Failed to transcribe voice message, using placeholder');
+        }
+      }
+
+      this.dispatchMessage(ctx, transcription, {
         mediaType: 'voice',
         duration: voice?.duration,
         fileId: voice?.file_id,
         fileUrl,
+        transcribed: transcription !== '[voice message]',
       });
     });
 
@@ -384,8 +411,8 @@ export class TelegramChannel implements ChannelAdapter {
       return;
     }
 
-    const chatId = this.resolveChatId(envelope);
-    if (!chatId) {
+    const chatId = this.resolveChatId(envelope) as string | number;
+    if (chatId == null) {
       logger.error({ envelope: envelope.id }, 'No chatId in envelope');
       return;
     }
@@ -394,7 +421,7 @@ export class TelegramChannel implements ChannelAdapter {
     const chunks = splitMessage(response, 4096);
 
     for (let i = 0; i < chunks.length; i++) {
-      await this.sendChunk(chatId, chunks[i], i === 0 ? replyToId : undefined);
+      await this.sendChunk(chatId, chunks[i]!, i === 0 ? replyToId : undefined);
     }
   }
 
@@ -467,6 +494,37 @@ export class TelegramChannel implements ChannelAdapter {
   }
 
   // ── Send media ──────────────────────────────────────────────────
+
+  /** Convert text to speech and send as a Telegram voice note (OGG/Opus) */
+  async sendVoiceNote(
+    envelope: MessageEnvelope,
+    text: string,
+    opts?: { voice?: string; speed?: number; provider?: string },
+  ): Promise<void> {
+    if (!this.bot) return;
+    const chatId = this.resolveChatId(envelope);
+    if (!chatId) return;
+
+    try {
+      const ttsResult = await ttsService.synthesize(text, {
+        voice: opts?.voice,
+        speed: opts?.speed,
+        format: 'ogg',
+        adapter: opts?.provider,
+      });
+
+      // Convert to OGG/Opus for Telegram voice note compatibility
+      const audio = ttsResult.audio.format === 'ogg'
+        ? ttsResult.audio
+        : await convertAudio(ttsResult.audio, 'ogg');
+
+      const source = new InputFile(audio.buffer, 'voice.ogg');
+      await this.bot.api.sendVoice(chatId, source);
+    } catch (err) {
+      logger.error({ error: (err as Error).message }, 'Failed to send voice note, falling back to text');
+      await this.send(envelope, text);
+    }
+  }
 
   async sendMedia(envelope: MessageEnvelope, media: MediaAttachment): Promise<void> {
     if (!this.bot) return;
@@ -551,7 +609,7 @@ export class TelegramChannel implements ChannelAdapter {
     tracked.currentText = text;
 
     try {
-      await this.bot.api.editMessageText(tracked.chatId, tracked.messageId, text, {
+      await this.bot.api.editMessageText(String(tracked.chatId), tracked.messageId, text, {
         parse_mode: 'MarkdownV2',
         link_preview_options: { is_disabled: true },
       });
@@ -571,7 +629,7 @@ export class TelegramChannel implements ChannelAdapter {
     if (chunks.length > 0) {
       for (const parse_mode of ['MarkdownV2', 'HTML', undefined] as const) {
         try {
-          await this.bot.api.editMessageText(tracked.chatId, tracked.messageId, chunks[0], {
+          await this.bot.api.editMessageText(String(tracked.chatId), tracked.messageId, chunks[0]!, {
             ...(parse_mode ? { parse_mode } : {}),
             link_preview_options: { is_disabled: true },
           });
@@ -584,7 +642,7 @@ export class TelegramChannel implements ChannelAdapter {
 
     // Send remaining chunks
     for (let i = 1; i < chunks.length; i++) {
-      await this.sendChunk(tracked.chatId, chunks[i]);
+      await this.sendChunk(String(tracked.chatId), chunks[i]!);
     }
 
     this.trackedMessages.delete(trackId);

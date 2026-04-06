@@ -291,7 +291,7 @@ export function resolveModel(modelId: string): ResolvedModel {
 
   if (parts.length >= 2) {
     // "provider/model" format
-    providerId = parts[0];
+    providerId = parts[0]!;
     modelName = parts.slice(1).join('/');
   } else {
     // Try to match by model name across all providers
@@ -371,7 +371,7 @@ export async function testProvider(providerId: string, model?: string): Promise<
     await generateText({
       model: resolved.instance,
       prompt: 'Say "ok" and nothing else.',
-      maxTokens: 5,
+      maxOutputTokens: 5,
     });
 
     return { ok: true, latencyMs: Date.now() - start };

@@ -1,6 +1,7 @@
 // LLM Provider — unified interface using multi-provider registry
 
 import { generateText, streamText, type ModelMessage, type Tool as AiTool } from 'ai';
+import { jsonSchema } from '@ai-sdk/provider-utils';
 import { resolveModel, type ResolvedModel } from './providers';
 import { logger } from '../shared/logger';
 import { eventBus } from '../shared/events';
@@ -104,7 +105,7 @@ export async function callLlm(options: LlmOptions): Promise<{
   for (const tool of tools) {
     aiTools[tool.name] = {
       description: tool.description,
-      parameters: tool.parameters as Record<string, unknown>,
+      inputSchema: jsonSchema(tool.parameters as Record<string, unknown>),
       execute: undefined as unknown as AiTool['execute'],
     };
   }
@@ -133,20 +134,22 @@ export async function callLlm(options: LlmOptions): Promise<{
         system: systemPrompt,
         messages,
         tools: Object.keys(aiTools).length > 0 ? aiTools : undefined,
-        maxTokens,
+        maxOutputTokens: maxTokens,
         temperature,
       }));
 
       recordSuccess(mid);
 
       // Emit token usage event
+      const usageInputTokens = result.usage?.inputTokens ?? 0;
+      const usageOutputTokens = result.usage?.outputTokens ?? 0;
       if (result.usage) {
         eventBus.emit('token:usage', {
           agentId: 'global',
           sessionId: 'llm-call',
           model: mid,
-          promptTokens: result.usage.promptTokens,
-          completionTokens: result.usage.completionTokens,
+          promptTokens: usageInputTokens,
+          completionTokens: usageOutputTokens,
           timestamp: Date.now(),
         });
       }
@@ -154,16 +157,16 @@ export async function callLlm(options: LlmOptions): Promise<{
       const toolCalls = result.toolCalls.map((tc) => ({
         id: tc.toolCallId,
         name: tc.toolName,
-        arguments: JSON.stringify(tc.args),
+        arguments: JSON.stringify('input' in tc ? tc.input : {}),
       }));
 
       return {
         content: result.text,
         toolCalls,
         usage: result.usage ? {
-          promptTokens: result.usage.promptTokens,
-          completionTokens: result.usage.completionTokens,
-          totalTokens: result.usage.promptTokens + result.usage.completionTokens,
+          promptTokens: usageInputTokens,
+          completionTokens: usageOutputTokens,
+          totalTokens: usageInputTokens + usageOutputTokens,
         } : undefined,
       };
     } catch (err) {
@@ -183,7 +186,7 @@ export async function* streamLlm(options: LlmOptions) {
   for (const tool of tools) {
     aiTools[tool.name] = {
       description: tool.description,
-      parameters: tool.parameters as Record<string, unknown>,
+      inputSchema: jsonSchema(tool.parameters as Record<string, unknown>),
       execute: undefined as unknown as AiTool['execute'],
     };
   }
@@ -196,7 +199,7 @@ export async function* streamLlm(options: LlmOptions) {
     system: systemPrompt,
     messages,
     tools: Object.keys(aiTools).length > 0 ? aiTools : undefined,
-    maxTokens,
+    maxOutputTokens: maxTokens,
     temperature,
   });
 
@@ -206,33 +209,35 @@ export async function* streamLlm(options: LlmOptions) {
   for await (const chunk of result.fullStream) {
     switch (chunk.type) {
       case 'text-delta':
-        totalOutput += chunk.textDelta.length;
-        yield { type: 'delta' as const, content: chunk.textDelta };
+        totalOutput += chunk.text.length;
+        yield { type: 'delta' as const, content: chunk.text };
         break;
       case 'tool-call':
         yield {
           type: 'tool_call' as const,
           id: chunk.toolCallId,
           name: chunk.toolName,
-          arguments: chunk.args,
+          arguments: 'input' in chunk ? chunk.input : {},
         };
         break;
-      case 'finish':
-        if (chunk.usage) {
-          totalInput = chunk.usage.promptTokens;
-          totalOutput = chunk.usage.completionTokens;
-          eventBus.emit('token:usage', {
-            agentId: 'global',
-            sessionId: 'llm-stream',
-            model: modelId,
-            promptTokens: totalInput,
-            completionTokens: totalOutput,
-            timestamp: Date.now(),
-          });
-        }
-        yield { type: 'done' as const, usage: chunk.usage };
+      case 'finish': {
+        const usage = chunk.totalUsage;
+        const pTokens = usage.inputTokens ?? 0;
+        const cTokens = usage.outputTokens ?? 0;
+        totalInput = pTokens;
+        totalOutput = cTokens;
+        eventBus.emit('token:usage', {
+          agentId: 'global',
+          sessionId: 'llm-stream',
+          model: modelId,
+          promptTokens: totalInput,
+          completionTokens: totalOutput,
+          timestamp: Date.now(),
+        });
+        yield { type: 'done' as const, usage: { promptTokens: pTokens, completionTokens: cTokens, totalTokens: pTokens + cTokens } };
         recordSuccess(modelId);
         break;
+      }
     }
   }
 }

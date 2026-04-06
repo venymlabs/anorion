@@ -13,6 +13,14 @@ class ToolRegistry {
     logger.debug({ tool: def.name }, 'Tool registered');
   }
 
+  unregister(name: string): boolean {
+    // Remove from all agent bindings
+    for (const [, bound] of this.perAgent) {
+      bound.delete(name);
+    }
+    return this.tools.delete(name);
+  }
+
   get(name: string): ToolDefinition | undefined {
     return this.tools.get(name);
   }

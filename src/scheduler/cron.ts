@@ -18,7 +18,7 @@ export interface ScheduleJob {
   createdAt: string;
 }
 
-type CronTask = { stop: () => void; task: cron.ScheduledTask };
+type CronTask = { stop: () => void; task: unknown };
 
 class ScheduleManager {
   private db: Db | null = null;

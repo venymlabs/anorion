@@ -100,9 +100,9 @@ function printHelp() {
   ];
 
   console.log(bold('Commands:\n'));
-  const maxLen = Math.max(...commands.map(c => c[0].length));
+  const maxLen = Math.max(...commands.map(c => c[0]!.length));
   for (const [cmd, desc] of commands) {
-    console.log(`  ${cyan(cmd.padEnd(maxLen + 2))} ${dim(desc)}`);
+    console.log(`  ${cyan((cmd ?? '').padEnd(maxLen + 2))} ${dim(desc ?? '')}`);
   }
 
   console.log(`\n${dim('Docs: https://docs.anorion.ai  •  Discord: https://discord.gg/anorion')}\n`);
@@ -211,9 +211,9 @@ async function cmdInit() {
   let model: string;
   if (models.length > 1) {
     const mIdx = await choose('Select model:', models);
-    model = models[mIdx] || defaultModels[providerId];
+    model = models[mIdx] ?? defaultModels[providerId] ?? "";
   } else {
-    model = models[0] || defaultModels[providerId];
+    model = models[0] ?? defaultModels[providerId] ?? "";
   }
 
   const fullModel = `${providerId}/${model}`;
@@ -444,12 +444,12 @@ async function cmdStatus() {
 
     // Memory
     try {
-      const mem = process.memoryUsage ? null : null;
+      const mem = process.memoryUsage?.() ?? null;
       const metricsRes = await fetch(`http://localhost:${port}/metrics`);
       if (metricsRes.ok) {
         const text = await metricsRes.text();
         const memMatch = text.match(/anorion_memory_rss_bytes (\d+)/);
-        if (memMatch) console.log(`  ${dim('Memory:')}    ${formatBytes(parseInt(memMatch[1]))}`);
+        if (memMatch) console.log(`  ${dim('Memory:')}    ${formatBytes(parseInt(memMatch[1]!))}`);
       }
     } catch {}
 
@@ -505,20 +505,21 @@ async function cmdConfig() {
       const parts = key.split('.');
       let obj: any = config;
       for (let i = 0; i < parts.length - 1; i++) {
-        if (!obj[parts[i]]) obj[parts[i]] = {};
-        obj = obj[parts[i]];
+        const part = parts[i]!;
+        if (!obj[part]) obj[part] = {};
+        obj = obj[part];
       }
       // Try to parse as number or boolean
       let parsed: any = value;
       if (value === 'true') parsed = true;
       else if (value === 'false') parsed = false;
       else if (!isNaN(Number(value))) parsed = Number(value);
-      obj[parts[parts.length - 1]] = parsed;
+      obj[parts[parts.length - 1]!] = parsed;
 
-      const { stringify: stringifyYaml, writeFileSync } = await import('yaml');
+      const { stringify: stringifyYaml } = await import('yaml');
       const yaml = stringifyYaml(config);
-      const { writeFileSync: write } = await import('node:fs');
-      write(resolve(getAnorionDir(), 'anorion.yaml'), yaml);
+      const { writeFileSync } = await import('node:fs');
+      writeFileSync(resolve(getAnorionDir(), 'anorion.yaml'), yaml);
       success(`${key} = ${parsed}`);
       return;
     }
@@ -888,8 +889,8 @@ async function cmdTool() {
 // ── Logs Command ─────────────────────────────────────────────────────
 
 async function cmdLogs() {
-  const linesFlag = args.indexOf('--lines') || args.indexOf('-n');
-  const numLines = linesFlag >= 0 ? parseInt(args[linesFlag + 1]) : 50;
+  const linesFlag = Math.max(args.indexOf('--lines'), args.indexOf('-n'));
+  const numLines = linesFlag >= 0 ? parseInt(args[linesFlag + 1]!) : 50;
 
   const homeDir = process.env.HOME || process.env.USERPROFILE || '/tmp';
   const anorionHome = resolve(homeDir, '.anorion');
@@ -909,7 +910,7 @@ async function cmdLogs() {
     if (existsSync(logDir)) {
       const { readdirSync } = await import('node:fs');
       const files = readdirSync(logDir).filter(f => f.endsWith('.log')).sort().reverse();
-      if (files.length > 0) logFile = resolve(logDir, files[0]);
+      if (files.length > 0) logFile = resolve(logDir, files[0]!);
     }
   }
 

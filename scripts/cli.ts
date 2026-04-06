@@ -40,7 +40,7 @@ async function status() {
       if (metrics.ok) {
         const text = await metrics.text();
         const memMatch = text.match(/anorion_memory_rss_bytes (\d+)/);
-        if (memMatch) console.log(`  Memory:    ${formatBytes(parseInt(memMatch[1]))}`);
+        if (memMatch) console.log(`  Memory:    ${formatBytes(parseInt(memMatch[1]!))}`);
       }
     } catch {}
   } catch {

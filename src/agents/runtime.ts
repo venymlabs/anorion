@@ -500,104 +500,260 @@ import { stepCountIs } from 'ai';
 
 // ── Streaming variant ──
 
-export async function* streamMessage(input: SendMessageInput) {
+export interface StreamMessageResult {
+  sessionId: string;
+  content: string;
+  toolCalls: ToolCall[];
+  toolResults: ToolResultEntry[];
+  usage?: { promptTokens: number; completionTokens: number; totalTokens: number };
+  durationMs: number;
+}
+
+export async function* streamMessage(input: SendMessageInput): AsyncGenerator<
+  { sessionId: string; chunk: StreamChunk },
+  StreamMessageResult,
+  undefined
+> {
   const agent = agentRegistry.get(input.agentId) || agentRegistry.getByName(input.agentId);
   if (!agent) throw new Error(`Agent not found: ${input.agentId}`);
 
-  let sessionId = input.sessionId;
-  if (!sessionId) {
-    const session = await sessionManager.create(agent.id, input.channelId);
-    sessionId = session.id;
+  agentRegistry.setState(agent.id, 'processing');
+
+  const abortController = new AbortController();
+  const signal = input.abortSignal ?? abortController.signal;
+  if (input.abortSignal) {
+    input.abortSignal.addEventListener('abort', () => abortController.abort(), { once: true });
   }
 
-  await sessionManager.addMessage({
-    sessionId,
-    agentId: agent.id,
-    role: 'user',
-    content: input.text,
-    priority: 'high',
-  });
-
-  const history = await sessionManager.getMessagesAsCore(sessionId, 50);
-  let contextMessages = history;
-  if (shouldCompact(history as any[])) {
-    const { messages: compacted } = compactMessages(history as any[]);
-    contextMessages = compacted as ModelMessage[];
-  }
-
-  const resolved = resolveModel(agent.model);
-  const agentTools = toolRegistry.listForAgent(agent.id);
-  const memoryContext = memoryManager.buildContext(agent.id);
-  const systemPrompt = memoryContext
-    ? `${agent.systemPrompt}\n\n${memoryContext}`
-    : agent.systemPrompt;
-
-  const aiTools: Record<string, AiTool> = {};
-  for (const t of agentTools) {
-    aiTools[t.name] = {
-      description: t.description,
-      inputSchema: jsonSchema(t.parameters as any),
-      execute: async (args: Record<string, unknown>) => {
-        const result = await executeTool(t, args, { agentId: agent.id, sessionId, signal: input.abortSignal });
-        if (result.error) return { error: result.error, content: result.content };
-        return result.content;
-      },
-    } as AiTool;
-  }
-
-  const stream = streamText({
-    model: resolved.instance,
-    system: systemPrompt,
-    messages: contextMessages,
-    tools: Object.keys(aiTools).length > 0 ? aiTools : undefined,
-    maxOutputTokens: 4096,
-    abortSignal: input.abortSignal,
-  });
-
-  let fullContent = '';
-  for await (const chunk of stream.fullStream) {
-    if (chunk.type === 'text-delta') {
-      const text = (chunk as any).delta ?? (chunk as any).text ?? '';
-      fullContent += text;
-      yield { sessionId, chunk: { type: 'delta', content: text } };
-      if (input.onChunk) input.onChunk({ type: 'delta', content: text });
-    } else if (chunk.type === 'tool-call') {
-      yield {
-        sessionId,
-        chunk: {
-          type: 'tool_call',
-          toolCall: { id: chunk.toolCallId, name: chunk.toolName, arguments: JSON.stringify((chunk as any).input ?? (chunk as any).args) },
-        },
-      };
-    } else if (chunk.type === 'tool-result') {
-      yield {
-        sessionId,
-        chunk: {
-          type: 'tool_result',
-          toolResult: { toolCallId: (chunk as any).toolCallId, toolName: (chunk as any).toolName, content: String((chunk as any).result) },
-        },
-      };
-    } else if (chunk.type === 'finish') {
-      const totalUsage = (chunk as any).totalUsage;
-      if (totalUsage) {
-        eventBus.emit('token:usage', {
-          agentId: agent.id,
-          sessionId,
-          model: agent.model,
-          promptTokens: totalUsage.inputTokens ?? 0,
-          completionTokens: totalUsage.outputTokens ?? 0,
-          timestamp: Date.now(),
-        });
-      }
-      yield { sessionId, chunk: { type: 'done' } };
+  let sessionId: string = input.sessionId ?? '';
+  try {
+    if (!sessionId) {
+      const session = await sessionManager.create(agent.id, input.channelId);
+      sessionId = session.id;
     }
-  }
 
-  await sessionManager.addMessage({
-    sessionId,
-    agentId: agent.id,
-    role: 'assistant',
-    content: fullContent,
-    model: agent.model,
-  });
+    eventBus.emit('agent:processing', { agentId: agent.id, sessionId, timestamp: Date.now() });
+
+    await sessionManager.addMessage({
+      sessionId,
+      agentId: agent.id,
+      role: 'user',
+      content: input.text,
+      priority: 'high',
+    });
+
+    const history = await sessionManager.getMessagesAsCore(sessionId, 50);
+    let contextMessages: ModelMessage[] = history;
+    if (shouldCompact(history as any[])) {
+      const { messages: compacted } = compactMessages(history as any[]);
+      contextMessages = compacted as ModelMessage[];
+      logger.info({ sessionId }, 'Context compacted before streaming');
+    }
+
+    if (!contextMessages.some((m) => m.role === 'user')) {
+      contextMessages.push({ role: 'user', content: input.text });
+    }
+
+    const memoryContext = memoryManager.buildContext(agent.id);
+    const systemPrompt = memoryContext
+      ? `${agent.systemPrompt}\n\n${memoryContext}`
+      : agent.systemPrompt;
+
+    const maxIter = input.maxIterations || agent.maxIterations || 10;
+    const resolved = resolveModel(agent.model);
+    const agentTools = toolRegistry.listForAgent(agent.id);
+
+    const aiTools: Record<string, AiTool> = {};
+    for (const t of agentTools) {
+      aiTools[t.name] = {
+        description: t.description,
+        inputSchema: jsonSchema(t.parameters as any),
+        execute: async (args: Record<string, unknown>) => {
+          if (signal.aborted) return { error: 'Aborted' };
+          const result = await executeTool(t, args, { agentId: agent.id, sessionId, signal });
+          if (result.error) return { error: result.error, content: result.content };
+          return result.content;
+        },
+      } as AiTool;
+    }
+
+    const hasTools = Object.keys(aiTools).length > 0;
+    const allToolCalls: ToolCall[] = [];
+    const allToolResults: ToolResultEntry[] = [];
+    let totalPromptTokens = 0;
+    let totalCompletionTokens = 0;
+
+    const streamStartTime = Date.now();
+    let fullContent = '';
+
+    // Attempt streaming — with retry on transient failures
+    const attemptStream = async function* (modelInstance: any, tools: Record<string, AiTool> | undefined) {
+      const stream = streamText({
+        model: modelInstance,
+        system: systemPrompt,
+        messages: contextMessages,
+        tools,
+        stopWhen: hasTools ? stepCountIs(maxIter) : stepCountIs(1),
+        maxOutputTokens: 4096,
+        abortSignal: signal,
+      });
+
+      for await (const chunk of stream.fullStream) {
+        if (signal.aborted) break;
+
+        if (chunk.type === 'text-delta') {
+          const text = (chunk as any).delta ?? (chunk as any).text ?? '';
+          fullContent += text;
+          const streamChunk: StreamChunk = { type: 'delta', content: text };
+          yield { sessionId, chunk: streamChunk };
+          if (input.onChunk) input.onChunk(streamChunk);
+          eventBus.emit('stream:delta', {
+            agentId: agent.id,
+            sessionId,
+            content: text,
+            accumulated: fullContent,
+            timestamp: Date.now(),
+          });
+        } else if (chunk.type === 'tool-call') {
+          const call: ToolCall = {
+            id: chunk.toolCallId,
+            name: chunk.toolName,
+            arguments: JSON.stringify((chunk as any).input ?? (chunk as any).args),
+          };
+          allToolCalls.push(call);
+          eventBus.emit('agent:tool-call', {
+            agentId: agent.id,
+            sessionId,
+            toolName: chunk.toolName,
+            toolCallId: chunk.toolCallId,
+            timestamp: Date.now(),
+          });
+          const streamChunk: StreamChunk = { type: 'tool_call', toolCall: call };
+          yield { sessionId, chunk: streamChunk };
+          if (input.onChunk) input.onChunk(streamChunk);
+        } else if (chunk.type === 'tool-result') {
+          const entry: ToolResultEntry = {
+            toolCallId: (chunk as any).toolCallId,
+            toolName: (chunk as any).toolName,
+            content: String((chunk as any).result),
+          };
+          allToolResults.push(entry);
+          const streamChunk: StreamChunk = { type: 'tool_result', toolResult: entry };
+          yield { sessionId, chunk: streamChunk };
+          if (input.onChunk) input.onChunk(streamChunk);
+        } else if (chunk.type === 'finish') {
+          const totalUsage = (chunk as any).totalUsage;
+          if (totalUsage) {
+            totalPromptTokens = totalUsage.inputTokens ?? 0;
+            totalCompletionTokens = totalUsage.outputTokens ?? 0;
+            eventBus.emit('token:usage', {
+              agentId: agent.id,
+              sessionId,
+              model: agent.model,
+              promptTokens: totalPromptTokens,
+              completionTokens: totalCompletionTokens,
+              timestamp: Date.now(),
+            });
+          }
+        }
+      }
+    };
+
+    try {
+      yield* attemptStream(resolved.instance, hasTools ? aiTools : undefined);
+    } catch (err) {
+      const cat = categorizeError(err as Error);
+
+      // On context_length error, compact and retry once
+      if (cat.category === 'context_length') {
+        logger.info({ sessionId }, 'Context length exceeded during streaming, forcing compaction');
+        const { messages: compacted } = compactMessages(history as any[], {
+          thresholdPercent: 0.5,
+          keepLastMessages: 10,
+        });
+        contextMessages = compacted as ModelMessage[];
+        fullContent = '';
+        yield* attemptStream(resolved.instance, hasTools ? aiTools : undefined);
+      } else if (agent.fallbackModel && (cat.category === 'model_error' || cat.category === 'rate_limit')) {
+        // Try fallback model
+        logger.warn({ fallback: agent.fallbackModel }, 'Streaming failed, trying fallback model');
+        const fallbackResolved = resolveModel(agent.fallbackModel);
+        fullContent = '';
+        yield* attemptStream(fallbackResolved.instance, hasTools ? aiTools : undefined);
+      } else {
+        throw err;
+      }
+    }
+
+    const durationMs = Date.now() - streamStartTime;
+
+    // Emit streaming done
+    eventBus.emit('stream:done', {
+      agentId: agent.id,
+      sessionId,
+      content: fullContent,
+      durationMs,
+      timestamp: Date.now(),
+    });
+
+    const usage = {
+      promptTokens: totalPromptTokens,
+      completionTokens: totalCompletionTokens,
+      totalTokens: totalPromptTokens + totalCompletionTokens,
+    };
+
+    // Yield final done chunk with usage
+    const doneChunk: StreamChunk = { type: 'done', usage };
+    yield { sessionId, chunk: doneChunk };
+    if (input.onChunk) input.onChunk(doneChunk);
+
+    // Store assistant response with complete data
+    await sessionManager.addMessage({
+      sessionId,
+      agentId: agent.id,
+      role: 'assistant',
+      content: fullContent || 'I processed your request but had no text response to share.',
+      toolCalls: allToolCalls.length > 0 ? allToolCalls : undefined,
+      toolResults: allToolResults.length > 0 ? allToolResults : undefined,
+      model: agent.model,
+      tokensIn: usage.promptTokens,
+      tokensOut: usage.completionTokens,
+      durationMs,
+    });
+
+    eventBus.emit('agent:response', {
+      agentId: agent.id,
+      sessionId,
+      content: fullContent,
+      durationMs,
+      tokensUsed: usage.totalTokens,
+      timestamp: Date.now(),
+    });
+
+    return {
+      sessionId,
+      content: fullContent,
+      toolCalls: allToolCalls,
+      toolResults: allToolResults,
+      usage,
+      durationMs,
+    };
+  } catch (err) {
+    const cat = categorizeError(err as Error);
+    eventBus.emit('stream:error', {
+      agentId: agent.id,
+      sessionId: sessionId || '',
+      error: (err as Error).message,
+      timestamp: Date.now(),
+    });
+
+    // Yield error chunk before throwing
+    const errorChunk: StreamChunk = { type: 'error', error: (err as Error).message };
+    yield { sessionId: sessionId || '', chunk: errorChunk };
+
+    throw err;
+  } finally {
+    agentRegistry.setState(agent.id, 'idle');
+    eventBus.emit('agent:idle', { agentId: agent.id, timestamp: Date.now() });
+  }
 }

@@ -91,15 +91,23 @@ openaiCompat.post('/v1/chat/completions', async (c) => {
       c.header('Connection', 'keep-alive');
       c.header('X-Accel-Buffering', 'no');
 
+      const abortController = new AbortController();
+      s.onAbort(() => {
+        abortController.abort();
+      });
+
       try {
         for await (const chunk of providerRegistry.chatCompletionStream(req)) {
+          if (abortController.signal.aborted) break;
           await s.write(`data: ${JSON.stringify(chunk)}\n\n`);
         }
         await s.write('data: [DONE]\n\n');
       } catch (err) {
-        logger.error({ error: (err as Error).message }, 'OpenAI compat stream error');
-        await s.write(`data: ${JSON.stringify({ error: { message: (err as Error).message, type: 'server_error' } })}\n\n`);
-        await s.write('data: [DONE]\n\n');
+        if (!abortController.signal.aborted) {
+          logger.error({ error: (err as Error).message }, 'OpenAI compat stream error');
+          await s.write(`data: ${JSON.stringify({ error: { message: (err as Error).message, type: 'server_error' } })}\n\n`);
+          await s.write('data: [DONE]\n\n');
+        }
       }
     });
   }

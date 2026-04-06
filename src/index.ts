@@ -8,7 +8,10 @@ import { memoryManager } from './memory/store';
 import { channelRouter } from './channels/router';
 import { TelegramChannel } from './channels/telegram';
 import { WebhookChannel } from './channels/webhook';
-import app, { setApiKeys, setBridge, registerBridgeRoutes } from './gateway/server';
+import { DiscordChannel } from './channels/discord';
+import { WhatsAppChannel } from './channels/whatsapp';
+import { SignalChannel } from './channels/signal';
+import app, { setBridge, registerBridgeRoutes } from './gateway/server';
 import routesV2 from './gateway/routes-v2';
 import { skillManager } from './tools/skill-manager';
 import { scheduleManager } from './scheduler/cron';
@@ -18,6 +21,7 @@ import { eventBus } from './shared/events';
 import { loadPipelinesFromFile, listPipelines } from './agents/pipeline';
 import { listConfiguredProviders } from './llm/providers';
 import { Federator } from './bridge/federator';
+import { mcpManager } from './tools/mcp/manager';
 
 import echoTool from './tools/builtin/echo';
 import shellTool from './tools/builtin/shell';
@@ -26,11 +30,13 @@ import fileReadTool from './tools/builtin/file-read';
 import fileWriteTool from './tools/builtin/file-write';
 import webSearchTool from './tools/builtin/web-search';
 import { memorySaveTool, memorySearchTool, memoryListTool } from './tools/builtin/memory';
+import { speakTool, transcribeTool, listenTool } from './tools/builtin/voice';
 import { spawnAgentTool } from './agents/subagent';
 
 const builtinTools = [
   echoTool, shellTool, httpRequestTool, fileReadTool, fileWriteTool,
-  webSearchTool, memorySaveTool, memorySearchTool, memoryListTool, spawnAgentTool,
+  webSearchTool, memorySaveTool, memorySearchTool, memoryListTool,
+  speakTool, transcribeTool, listenTool, spawnAgentTool,
 ];
 
 // ── Bootstrap ──
@@ -47,7 +53,7 @@ async function main() {
 
   // 3. Load agents from directory
   if (config.agents.dir) {
-    agentRegistry.setDb(database.raw, database.prepared);
+    agentRegistry.setDb(database.db, database.prepared);
     memoryManager.setDb(database.raw);
     sessionManager.setDb(database.db, database.prepared);
     await agentRegistry.loadFromDirectory(config.agents.dir);
@@ -64,9 +70,23 @@ async function main() {
   }
   logger.info({ tools: builtinTools.map(t => t.name) }, 'Builtin tools registered');
 
+  // 4b. Connect MCP servers and register their tools
+  if (config.mcp?.servers?.length) {
+    for (const serverConfig of config.mcp.servers) {
+      mcpManager.addServer({
+        ...serverConfig,
+        transport: serverConfig.transport.type === 'stdio'
+          ? { ...serverConfig.transport, env: (serverConfig.transport as { env?: Record<string, unknown> }).env as Record<string, string> | undefined }
+          : { ...serverConfig.transport, headers: (serverConfig.transport as { headers?: Record<string, unknown> }).headers as Record<string, string> | undefined },
+      });
+    }
+    const mcpResult = await mcpManager.connectAll();
+    logger.info(mcpResult, 'MCP servers connected');
+  }
+
   // 5. Set API keys
   if (config.gateway.apiKeys.length > 0) {
-    setApiKeys(config.gateway.apiKeys);
+    // API keys are now configured via gateway middleware
     logger.info({ keys: config.gateway.apiKeys.map(k => k.name) }, 'API keys configured');
   }
 
@@ -129,6 +149,59 @@ async function main() {
     logger.info('Webhook channel started');
   }
 
+  if (channels.discord.enabled) {
+    const dc = new DiscordChannel({
+      botToken: channels.discord.botToken,
+      allowedGuilds: channels.discord.allowedGuilds,
+      allowedUsers: channels.discord.allowedUsers,
+      defaultAgent: channels.discord.defaultAgent,
+      maxMessageLength: channels.discord.maxMessageLength,
+    });
+    channelRouter.registerChannel(dc);
+    channelRouter.startChannel('discord').then(() => {
+      logger.info('Discord channel started');
+    }).catch((err: Error) => {
+      logger.error({ error: err.message }, 'Discord channel failed to start');
+    });
+  }
+
+  if (channels.whatsapp.enabled) {
+    const wa = new WhatsAppChannel({
+      authDir: channels.whatsapp.authDir,
+      allowedNumbers: channels.whatsapp.allowedNumbers,
+      allowedGroups: channels.whatsapp.allowedGroups,
+      defaultAgent: channels.whatsapp.defaultAgent,
+      handleGroups: channels.whatsapp.handleGroups,
+      groupPrefix: channels.whatsapp.groupPrefix,
+    });
+    channelRouter.registerChannel(wa);
+    channelRouter.startChannel('whatsapp').then(() => {
+      logger.info('WhatsApp channel started');
+    }).catch((err: Error) => {
+      logger.error({ error: err.message }, 'WhatsApp channel failed to start');
+    });
+  }
+
+  if (channels.signal.enabled) {
+    const sg = new SignalChannel({
+      apiUrl: channels.signal.apiUrl,
+      phoneNumber: channels.signal.phoneNumber,
+      allowedNumbers: channels.signal.allowedNumbers,
+      allowedGroups: channels.signal.allowedGroups,
+      defaultAgent: channels.signal.defaultAgent,
+      pollIntervalMs: channels.signal.pollIntervalMs,
+      handleGroups: channels.signal.handleGroups,
+      groupPrefix: channels.signal.groupPrefix,
+      attachmentDir: channels.signal.attachmentDir,
+    });
+    channelRouter.registerChannel(sg);
+    channelRouter.startChannel('signal').then(() => {
+      logger.info('Signal channel started');
+    }).catch((err: Error) => {
+      logger.error({ error: err.message }, 'Signal channel failed to start');
+    });
+  }
+
   // 9. Load pipelines
   const { existsSync } = await import('fs');
   const pipelinesPath = new URL('../../pipelines.yaml', import.meta.url).pathname;
@@ -140,7 +213,7 @@ async function main() {
   // 10. Bridge / Federation
   if (config.bridge.enabled) {
     const { BridgeServer } = await import('./bridge/server');
-    const bridgeServer = new BridgeServer(config.bridge.port, config.bridge.secret);
+    const bridgeServer = new BridgeServer(String(config.bridge.port), config.bridge.secret);
     const federator = new Federator(crypto.randomUUID(), config.bridge.secret, bridgeServer);
     setBridge(federator);
 
@@ -162,9 +235,25 @@ async function main() {
   const configured = providers.filter(p => p.configured);
   logger.info({ providers: configured.map(p => `${p.icon} ${p.name}`) }, 'Configured LLM providers');
 
+  // 12b. Initialize voice module
+  if (config.voice.enabled) {
+    try {
+      const { voiceConversation } = await import('./voice/conversation');
+      logger.info({ provider: config.voice.ttsProvider }, 'Voice module enabled');
+
+      // Periodic cleanup of idle voice sessions every 5 minutes
+      setInterval(() => {
+        voiceConversation.cleanupIdleSessions(config.voice.conversationSilenceMs || 300_000);
+      }, 5 * 60_000);
+    } catch {
+      logger.warn('Voice module not available');
+    }
+  }
+
   // 13. Graceful shutdown
-  const shutdown = async (signal: string) => {
-    logger.info({ signal }, 'Shutting down...');
+  const shutdown = async (sig: string) => {
+    logger.info({ signal: sig }, 'Shutting down...');
+    await mcpManager.disconnectAll();
     await channelRouter.stopAll();
     server.stop(true);
     database.raw.close();

@@ -1,4 +1,4 @@
-import type { ToolDefinition, ToolResult } from '../../shared/types';
+import type { ToolDefinition, ToolResult } from '../../src/shared/types';
 
 const config = { timezone: 'UTC' };
 
@@ -17,7 +17,7 @@ const currentTimeTool: ToolDefinition = {
   },
   category: 'utility',
   timeoutMs: 1000,
-  execute: async (params): Promise<ToolResult> => {
+  execute: async (params: Record<string, unknown>): Promise<ToolResult> => {
     const now = new Date();
     const format = String(params.format || 'readable');
     switch (format) {

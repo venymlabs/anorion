@@ -163,7 +163,7 @@ class AuditLogger {
   }
 
   private subscribeToEvents(): void {
-    eventBus.on('tool:executed', (data) => {
+    eventBus.on('tool:executed', (data: any) => {
       this.log({
         timestamp: new Date(data.timestamp).toISOString(),
         agentId: data.agentId,
@@ -175,7 +175,7 @@ class AuditLogger {
       });
     });
 
-    eventBus.on('agent:response', (data) => {
+    eventBus.on('agent:response', (data: any) => {
       this.log({
         timestamp: new Date(data.timestamp).toISOString(),
         agentId: data.agentId,
@@ -187,7 +187,7 @@ class AuditLogger {
       });
     });
 
-    eventBus.on('agent:error', (data) => {
+    eventBus.on('agent:error', (data: any) => {
       this.log({
         timestamp: new Date(data.timestamp).toISOString(),
         agentId: data.agentId,
@@ -198,7 +198,7 @@ class AuditLogger {
       });
     });
 
-    eventBus.on('memory:saved', (data) => {
+    eventBus.on('memory:saved', (data: any) => {
       this.log({
         timestamp: new Date(data.timestamp).toISOString(),
         agentId: data.agentId,
@@ -209,7 +209,7 @@ class AuditLogger {
       });
     });
 
-    eventBus.on('bridge:message:forwarded', (data) => {
+    eventBus.on('bridge:message:forwarded', (data: any) => {
       this.log({
         timestamp: new Date(data.timestamp).toISOString(),
         agentId: data.targetAgentId,

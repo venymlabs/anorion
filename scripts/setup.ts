@@ -75,8 +75,7 @@ async function main() {
   const providerNames = PROVIDERS.map((p) => `${p.icon} ${p.name}`);
   const providerIdx = await choose('Select your primary LLM provider:', providerNames);
   const selectedProvider = PROVIDERS[providerIdx];
-
-  if (!process.env[selectedProvider.envKey]) {
+  if (!selectedProvider) throw new Error('No provider selected'); {
     const key = await prompt(`Enter your ${selectedProvider.name} API key (${selectedProvider.envKey})`);
     if (key) {
       config.gateway._envHints = config.gateway._envHints || {};
@@ -112,6 +111,7 @@ async function main() {
   if (await confirm('Configure a fallback model?', false)) {
     const fbProviderIdx = await choose('Fallback provider:', providerNames);
     const fbProvider = PROVIDERS[fbProviderIdx];
+    if (!fbProvider) throw new Error('No fallback provider selected');
     const fbModelIdx = await choose(`Fallback model for ${fbProvider.name}:`, fbProvider.popularModels);
     config.agents.fallbackModel = `${fbProvider.id}/${fbProvider.popularModels[fbModelIdx] || fbProvider.defaultModel}`;
   }
@@ -194,7 +194,7 @@ async function main() {
 
   if (await confirm('Test LLM connection now?', true)) {
     console.log(`  Testing ${selectedProvider.name}...`);
-    const result = await testProvider(selectedProvider.id, config.agents.defaultModel.split('/').pop());
+    const result = await testProvider(selectedProvider.id, config.agents.defaultModel.split('/').pop()!);
     if (result.ok) {
       console.log(`  ✅ Connected! Latency: ${result.latencyMs}ms`);
     } else {

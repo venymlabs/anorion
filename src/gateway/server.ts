@@ -249,6 +249,13 @@ app.post('/api/v1/agents/:id/stream', async (c) => {
     c.header('Content-Type', 'text/event-stream');
     c.header('Cache-Control', 'no-cache');
     c.header('Connection', 'keep-alive');
+    c.header('X-Accel-Buffering', 'no');
+
+    // Set up abort signal for client disconnect
+    const abortController = new AbortController();
+    stream.onAbort(() => {
+      abortController.abort();
+    });
 
     try {
       const gen = streamMessage({
@@ -256,21 +263,27 @@ app.post('/api/v1/agents/:id/stream', async (c) => {
         text: parsed.data.text,
         sessionId: parsed.data.sessionId,
         channelId: parsed.data.channelId,
+        abortSignal: abortController.signal,
       });
 
       let lastSessionId = '';
       for await (const { sessionId, chunk } of gen) {
+        if (abortController.signal.aborted) break;
         lastSessionId = sessionId;
         if (chunk.type === 'delta') {
           await stream.write(`event: delta\ndata: ${JSON.stringify({ content: chunk.content, sessionId })}\n\n`);
         } else if (chunk.type === 'tool_call') {
-          await stream.write(`event: tool_call\ndata: ${JSON.stringify({ toolName: chunk.name, toolCallId: chunk.id, sessionId })}\n\n`);
+          await stream.write(`event: tool_call\ndata: ${JSON.stringify({ toolName: chunk.toolCall?.name, toolCallId: chunk.toolCall?.id, sessionId })}\n\n`);
+        } else if (chunk.type === 'tool_result') {
+          await stream.write(`event: tool_result\ndata: ${JSON.stringify({ toolName: chunk.toolResult?.toolName, toolCallId: chunk.toolResult?.toolCallId, content: chunk.toolResult?.content, sessionId })}\n\n`);
         }
       }
 
       await stream.write(`event: done\ndata: ${JSON.stringify({ sessionId: lastSessionId, timestamp: Date.now() })}\n\n`);
     } catch (err) {
-      await stream.write(`event: error\ndata: ${JSON.stringify({ error: (err as Error).message })}\n\n`);
+      if (!abortController.signal.aborted) {
+        await stream.write(`event: error\ndata: ${JSON.stringify({ error: (err as Error).message })}\n\n`);
+      }
     }
   });
 });

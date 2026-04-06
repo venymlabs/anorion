@@ -102,7 +102,7 @@ export async function executePipeline(
   const allOutputs: string[] = [];
 
   for (let i = 0; i < definition.steps.length; i++) {
-    const step = definition.steps[i];
+    const step = definition.steps[i]!;
     const stepStart = Date.now();
 
     // Resolve agent
@@ -153,7 +153,7 @@ export async function executePipeline(
     const durationMs = Date.now() - stepStart;
 
     if (stepResult) {
-      let output = stepResult.content;
+      let output: string = stepResult.content ?? '';
 
       // Apply transform
       switch (step.transform) {
@@ -164,10 +164,10 @@ export async function executePipeline(
           } catch { /* keep raw */ }
           break;
         case 'first-line':
-          output = output.split('\n')[0];
+          output = output.split('\n')[0] ?? output;
           break;
         case 'last-line':
-          output = output.split('\n').filter(Boolean).pop() || output;
+          output = output.split('\n').filter(Boolean).pop() ?? output;
           break;
       }
 

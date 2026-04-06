@@ -42,7 +42,7 @@ class TokenBudgetManager {
     this.lastGlobalReset = this.startOfDay();
 
     // Listen to token usage events
-    eventBus.on('token:usage', (data) => {
+    eventBus.on('token:usage', (data: any) => {
       this.recordUsage(data.agentId, data.sessionId, data.promptTokens + data.completionTokens);
     });
   }

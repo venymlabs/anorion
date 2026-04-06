@@ -37,7 +37,13 @@ const TRACE_EVENTS: EventName[] = [
   'token:usage',
 ];
 
-const ALL_BROADCAST_EVENTS = [...AGENT_EVENTS, ...SESSION_EVENTS, ...TRACE_EVENTS];
+const STREAM_EVENTS: EventName[] = [
+  'stream:delta',
+  'stream:done',
+  'stream:error',
+];
+
+const ALL_BROADCAST_EVENTS = [...AGENT_EVENTS, ...SESSION_EVENTS, ...TRACE_EVENTS, ...STREAM_EVENTS];
 
 // Heartbeat checker
 let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
